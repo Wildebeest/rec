@@ -1,0 +1,7 @@
+version: 2
+updates:
+  # Rec installs Pi from this exact pin and lockfile; bumps run the client launch test.
+  - package-ecosystem: npm
+    directory: /cli/clients/pi
+    schedule:
+      interval: weekly

@@ -1,0 +1,27 @@
+diff --git a/packages/plugin/src/tui/context.ts b/packages/plugin/src/tui/context.ts
+index fe641b3..7f40463 100644
+--- a/packages/plugin/src/tui/context.ts
++++ b/packages/plugin/src/tui/context.ts
+@@ -192,6 +192,7 @@ export interface SlotMap {
+   readonly app: Readonly<Record<string, never>>
+   readonly "home.footer": Readonly<Record<string, never>>
+   readonly "home.footer.status": Readonly<Record<string, never>>
++  readonly "home.logo": Readonly<Record<string, never>>
+   readonly "prompt.footer": PromptFooterInput
+   readonly "prompt.footer.status": PromptFooterInput
+   readonly "prompt.footer.file": PromptFooterInput
+diff --git a/packages/tui/src/routes/home.tsx b/packages/tui/src/routes/home.tsx
+index 71e7b64..babb039 100644
+--- a/packages/tui/src/routes/home.tsx
++++ b/packages/tui/src/routes/home.tsx
+@@ -94,7 +94,9 @@ export function Home() {
+             setLogoWidth(this.width)
+           }}
+         >
+-          <Logo />
++          <Slot path="home.logo">
++            <Logo />
++          </Slot>
+         </box>
+         <box height={1} flexShrink={0} />
+         <UpdateNotification width={logoWidth()} />

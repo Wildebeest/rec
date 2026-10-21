@@ -1,0 +1,20 @@
+diff --git a/packages/util/src/global-roots.ts b/packages/util/src/global-roots.ts
+index a9324e4..dcaf2ea 100644
+--- a/packages/util/src/global-roots.ts
++++ b/packages/util/src/global-roots.ts
+@@ -9,6 +9,15 @@ const state = process.env.XDG_STATE_HOME || (home ? path.join(home, ".local", "s
+ 
+ /** The XDG base directories that root opencode's global paths. */
+ export function roots(app: string) {
++  const user = process.env.REC_OPENCODE_HOME
++  if (user)
++    return {
++      data: path.join(user, "data"),
++      cache: path.join(user, "cache"),
++      config: path.join(user, "config"),
++      state: path.join(user, "state"),
++      tmp: path.join(os.tmpdir(), app),
++    }
+   return {
+     data: path.join(data!, app),
+     cache: path.join(cache!, app),

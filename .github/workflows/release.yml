@@ -1,0 +1,33 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: '1.26.x'
+      - name: Build and package
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          uv python install 3.12.12
+          python_root="$(uv python dir)/cpython-3.12.12-macos-aarch64-none"
+          "$python_root/bin/python3.12" packaging/build-mlx-runtime.py --python-root "$python_root" --output .build/bundle-mlx
+          python3 packaging/package.py --runtime-dir .build/bundle-mlx --manifest packaging/flint-int4-mlx.json \
+            --version "$version" --output dist/rec-darwin-arm64
+          test "$(dist/rec-darwin-arm64 --version)" = "rec $version"
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=()
+          case "$GITHUB_REF_NAME" in *-*) prerelease=(--prerelease);; esac
+          gh release create "$GITHUB_REF_NAME" "${prerelease[@]}" --verify-tag --generate-notes \
+            --title "rec $GITHUB_REF_NAME" dist/rec-darwin-arm64 dist/rec-darwin-arm64.meta

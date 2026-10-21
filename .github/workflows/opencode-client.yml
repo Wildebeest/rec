@@ -1,0 +1,27 @@
+# Builds the Recursive-branded OpenCode client once per pinned OpenCode version.
+# Push a tag named opencode-rec-<version>[-<n>], then pin the printed asset and
+# its release download URL in cli/clients/opencode/pins.json.
+name: OpenCode client
+on:
+  push:
+    tags: ['opencode-rec-*']
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: '1.4.2'
+      - run: python3 packaging/build-opencode-client.py --output dist/opencode-darwin-arm64.gz | tee -a "$GITHUB_STEP_SUMMARY"
+        shell: bash
+      # A prerelease never becomes GitHub's latest release, which the public installer uses.
+      - run: >
+          gh release create "$GITHUB_REF_NAME" --prerelease --latest=false
+          --title "OpenCode client $GITHUB_REF_NAME"
+          --notes "OpenCode with Recursive's logo hook and REC_OPENCODE_HOME, built from cli/clients/opencode/pins.json for rec launch opencode."
+          dist/opencode-darwin-arm64.gz cli/clients/opencode/LICENSE.opencode cli/clients/opencode/THIRD-PARTY-NOTICES.md
+        env:
+          GH_TOKEN: ${{ github.token }}

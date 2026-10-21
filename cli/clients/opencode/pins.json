@@ -1,0 +1,14 @@
+{
+  "version": "2.0.29",
+  "repository": "https://github.com/anomalyco/opencode.git",
+  "commit": "042d0832f5f3a73eaa039a58a7d565776f6d4290",
+  "bun": "1.4.2",
+  "patch_source": "https://github.com/pranavsreedhar123/opencode/commit/b70a0f8378a5faf928043a3d5ac5b17b5964ae98",
+  "client": {
+    "tag": "opencode-rec-2.0.29-1",
+    "name": "opencode-darwin-arm64.gz",
+    "url": "https://github.com/recursive-oss/rec/releases/download/opencode-rec-2.0.29-1/opencode-darwin-arm64.gz",
+    "size": 86372353,
+    "sha256": "2b3e4d7d2e613ff684b8dc60a434508e4998b68d9f0c43ab3dc185798c547c09"
+  }
+}
