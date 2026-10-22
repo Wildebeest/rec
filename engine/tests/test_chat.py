@@ -2,13 +2,15 @@ import hashlib
 import json
 import tempfile
 import unittest
+import uuid
 from importlib.resources import files
 from pathlib import Path
+from types import SimpleNamespace
 
 from tokenizers import Tokenizer, models, pre_tokenizers
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
-from rec_mlx.chat import load_tokenizer, normalize_messages, parse_tool_call
+from rec_mlx.chat import load_tokenizer, normalize_messages, parse_tool_call, seeded_tool_parser
 
 
 class FlintChatTests(unittest.TestCase):
@@ -173,3 +175,42 @@ class ToolCallParsingTests(unittest.TestCase):
         ):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 parse_tool_call(text, self.TOOLS)
+
+    def test_seeded_tool_call_ids_repeat_for_the_same_request(self):
+        text = self.render({"path": "a.py"})
+
+        def sample(**overrides):
+            values = {
+                "temperature": 1.0,
+                "top_p": 0.95,
+                "top_k": 20,
+                "presence_penalty": 0.0,
+                "max_tokens": 16,
+                "seed": 42,
+            }
+            values.update(overrides)
+            return SimpleNamespace(**values)
+
+        def ids(prompt, **overrides):
+            parse = seeded_tool_parser(sample(**overrides), prompt)
+            return [parse(text, self.TOOLS)["id"] for _ in range(2)]
+
+        first = ids([1, 2, 3])
+        self.assertEqual(ids([1, 2, 3]), first)
+        self.assertEqual(ids([1, 2, 3], temperature=1), first)
+        self.assertNotEqual(first[0], first[1])
+        self.assertNotEqual(ids([1, 2, 3], seed=43), first)
+        self.assertNotEqual(ids([1, 2, 4]), first)
+        for name, value in (
+            ("temperature", 0.2),
+            ("top_p", 0.5),
+            ("top_k", 4),
+            ("presence_penalty", 1.5),
+            ("max_tokens", 8),
+        ):
+            with self.subTest(name=name):
+                self.assertNotEqual(ids([1, 2, 3], **{name: value}), first)
+        self.assertEqual(uuid.UUID(first[0]).version, 4)
+        call = seeded_tool_parser(sample(), [1, 2, 3])(text, self.TOOLS)
+        self.assertEqual(call.pop("id"), first[0])
+        self.assertEqual(call, parse_tool_call(text, self.TOOLS))
