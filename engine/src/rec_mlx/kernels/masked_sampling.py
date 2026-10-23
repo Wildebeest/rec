@@ -123,10 +123,12 @@ if(!active) {{
                 if return_logprobs:
                     report = flat / temperature if temperature else flat
                     selected_logprobs.append(report[token] - mx.logsumexp(report))
+                    active = mx.depends(active, selected_logprobs[-1])
                 if grammar_handle is not None:
                     grammar_mask = grammar_native.mask(token, active, grammar_handle, 4692)
                 if presence_penalty:
                     presence_mask = presence_mask.at[token].maximum(active.astype(mx.float32))
+                    active = mx.depends(active, presence_mask)
                 tokens.append(token)
                 masks.append(active)
                 diagnostics.append(out[2])

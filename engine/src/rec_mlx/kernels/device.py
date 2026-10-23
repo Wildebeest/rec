@@ -14,6 +14,7 @@ class DeviceProfile:
 
 def profile_for_device(info):
     chips = {
+        ("applegpu_g13s", "Apple M1 Max"): "M1 Max",
         ("applegpu_g16s", "Apple M4 Pro"): "M4 Pro",
         ("applegpu_g17s", "Apple M5 Pro"): "M5 Pro",
         ("applegpu_g17s", "Apple M5 Max"): "M5 Max",
@@ -22,6 +23,15 @@ def profile_for_device(info):
     identity = (architecture, info["device_name"])
     if identity not in chips:
         raise ValueError(f"Unsupported resident kernel device: {identity}")
+    if chips[identity] == "M1 Max":
+        return DeviceProfile(
+            chip=chips[identity],
+            architecture=architecture,
+            workers=32,
+            mlp_workers=32,
+            head_workers=32,
+            prefill_chunk_size=2048,
+        )
     if chips[identity] == "M5 Max":
         return DeviceProfile(
             chip=chips[identity],
