@@ -414,12 +414,15 @@ def translate_msl_to_cuda(header: str, source: str) -> tuple[str, str]:
         "float(__ldg(&m.s[gi])),float(__ldg(&m.b[gi]))",
     )
 
-    # Coalesce 4-element bfloat16 KV loads in attention_partial_path_w53 into 64-bit __ldg(uint2*).
+    # Coalesce 4-element bfloat16 KV loads in attention_partial_path_w53 into 64-bit __ldg(uint2*),
+    # specialize direct p0 pointer arithmetic for !ROUNDED (all 34 SWA layers),
+    # share K/V address calculation, and avoid dynamic register-array indexing.
     header = header.replace(
         "            float key[4],value[4];for(uint j=0;j<4;++j){key[j]=float(key_base[at+j]);value[j]=float(value_base[at+j]);}",
         "            bfloat16_t rk[4],rv[4];\n"
-        "            *((uint2*)rk)=__ldg((const uint2*)key_base.address(at));\n"
-        "            *((uint2*)rv)=__ldg((const uint2*)value_base.address(at));\n"
+        "            const device bfloat16_t* kp=key_base.address(at);\n"
+        "            *((uint2*)rk)=__ldg((const uint2*)kp);\n"
+        "            *((uint2*)rv)=__ldg((const uint2*)(kp+cap*512u));\n"
         "            float key[4],value[4];for(uint j=0;j<4;++j){key[j]=float(rk[j]);value[j]=float(rv[j]);}",
     )
     header = header.replace(
@@ -429,20 +432,57 @@ def translate_msl_to_cuda(header: str, source: str) -> tuple[str, str]:
         "        }",
         "        if(token<count) {\n"
         "            uint at=uint(token)*128;\n"
-        "            *((uint2*)next_key)=__ldg((const uint2*)key_base.address(at));\n"
-        "            *((uint2*)next_value)=__ldg((const uint2*)value_base.address(at));\n"
+        "            const device bfloat16_t* kp=ROUNDED?key_base.address(at):(key_base.p0+key_base.offset+at);\n"
+        "            *((uint2*)next_key)=__ldg((const uint2*)kp);\n"
+        "            *((uint2*)next_value)=__ldg((const uint2*)(kp+cap*512u));\n"
         "        }",
     )
     header = header.replace(
+        "            float key[4];bfloat16_t value[4];\n"
+        "            for(uint j=0;j<4;++j){key[j]=float(next_key[j]);value[j]=next_value[j];}\n"
         "            if(token+parts<count)for(uint j=0;j<4;++j) {\n"
         "                uint next=at+parts*128+j;\n"
         "                next_key[j]=key_base[next];next_value[j]=value_base[next];\n"
-        "            }",
+        "            }\n"
+        "            float scores[HEADS];\n"
+        "            for(uint h=0;h<HEADS;++h) {\n"
+        "                float score=0.0f;for(uint j=0;j<4;++j)score+=query[h][j]*key[j];\n"
+        "                scores[h]=simd_sum(score);\n"
+        "            }\n"
+        "            float old=0.0f,add=0.0f;\n"
+        "            if(lane<HEADS) {\n"
+        "                float score=scores[lane],next=max(hi,score),low=metal::fast::exp(-metal::abs(score-hi));",
+        "            float key[4],value[4];\n"
+        "            #pragma unroll\n"
+        "            for(uint j=0;j<4;++j){key[j]=float(next_key[j]);value[j]=float(next_value[j]);}\n"
         "            if(token+parts<count) {\n"
         "                uint next=at+parts*128;\n"
-        "                *((uint2*)next_key)=__ldg((const uint2*)key_base.address(next));\n"
-        "                *((uint2*)next_value)=__ldg((const uint2*)value_base.address(next));\n"
-        "            }",
+        "                const device bfloat16_t* kp=ROUNDED?key_base.address(next):(key_base.p0+key_base.offset+next);\n"
+        "                *((uint2*)next_key)=__ldg((const uint2*)kp);\n"
+        "                *((uint2*)next_value)=__ldg((const uint2*)(kp+cap*512u));\n"
+        "            }\n"
+        "            float my_score=0.0f;\n"
+        "            #pragma unroll\n"
+        "            for(uint h=0;h<HEADS;++h) {\n"
+        "                float score=0.0f;\n"
+        "                #pragma unroll\n"
+        "                for(uint j=0;j<4;++j)score+=query[h][j]*key[j];\n"
+        "                score=simd_sum(score);\n"
+        "                if(lane==h)my_score=score;\n"
+        "            }\n"
+        "            float old=0.0f,add=0.0f;\n"
+        "            if(lane<HEADS) {\n"
+        "                float score=my_score,next=max(hi,score),low=metal::fast::exp(-metal::abs(score-hi));",
+    )
+    header = header.replace(
+        "for(uint j=0;j<4;++j)acc[h][j]=acc[h][j]*factor+weight*float(value[j]);",
+        "#pragma unroll\n                for(uint j=0;j<4;++j)acc[h][j]=acc[h][j]*factor+weight*value[j];",
+    )
+
+    # Align long-context global attention partition counts (parts) to 160-SM (1280-warp / 320-warp-per-KV-team) waves on RTX 5090.
+    source = source.replace(
+        "uint parts=rounded?(count==1024?64:count<=8192?128:(count<=32768?256:(count<=65536?512:1024))):32;",
+        "uint parts=rounded?(count==1024?64:count<=16384?320:(count<=65536?640:960)):32;",
     )
 
     # Scalar bool input 'active' in FilteredResidentSampler is passed as const bool* in CUDA.
