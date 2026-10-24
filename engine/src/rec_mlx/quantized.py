@@ -21,58 +21,69 @@ class QATModel:
         export = self.config["mlx_export"]
         assert export["bits"] == 4 and export["routed_expert_bits"] in (3, 4)
         assert export["embedding_bits"] == 8
-        native = Model(ModelArgs.from_dict(self.config))
+        use_cpu_staging = mx.device_info().get("architecture", "").startswith("sm_")
+        load_stream = mx.cpu if use_cpu_staging else mx.default_stream(mx.default_device())
+        with mx.stream(load_stream):
+            native = Model(ModelArgs.from_dict(self.config))
 
-        def quantization(path, module):
-            if not hasattr(module, "to_quantized"):
-                return False
-            bits = 4
-            if path == "model.embed_tokens":
-                bits = 8
-            elif ".switch_mlp." in path:
-                bits = export["routed_expert_bits"]
-            return {"group_size": 64, "bits": bits, "mode": "affine"}
+            def quantization(path, module):
+                if not hasattr(module, "to_quantized"):
+                    return False
+                bits = 4
+                if path == "model.embed_tokens":
+                    bits = 8
+                elif ".switch_mlp." in path:
+                    bits = export["routed_expert_bits"]
+                return {"group_size": 64, "bits": bits, "mode": "affine"}
 
-        nn.quantize(native, class_predicate=quantization)
-        weights = {}
-        for path in sorted(directory.glob("model-*.safetensors")):
-            shard = mx.load(str(path))
-            assert not weights.keys() & shard.keys(), f"Duplicate tensor in {path}"
-            weights.update(shard)
-        native.load_weights(list(native.sanitize(weights).items()), strict=True)
-        native.eval()
-        mx.eval(native.parameters())
-        self.native = native
-        self.embedding = native.model.embed_tokens
-        self.head = native.lm_head
-        self.norm = native.model.norm.weight
-        self.layers = []
-        for index, layer in enumerate(native.layers):
-            attention = layer.self_attn
-            a = SimpleNamespace(
-                q=attention.q_proj,
-                k=attention.k_proj,
-                v=attention.v_proj,
-                o=attention.o_proj,
-                q_norm=attention.q_norm.weight,
-                k_norm=attention.k_norm.weight,
-                sinks=attention.softmax_offset.astype(mx.bfloat16),
-                is_global=not attention.use_rope,
-            )
-            if index in self.config["mlp_only_layers"]:
-                mlp = projections(layer.mlp)
-            else:
-                mlp = projections(layer.mlp.switch_mlp)
-                mlp.shared = projections(layer.mlp.shared_expert)
-                mlp.router_weight = layer.mlp.gate.weight.astype(mx.float32)
-                mlp.expert_bias = layer.mlp.gate.expert_bias.astype(mx.float32)
-            self.layers.append(
-                SimpleNamespace(
-                    attention=a,
-                    mlp=mlp,
-                    input_norm=layer.input_layernorm.weight,
-                    post_norm=layer.post_attention_layernorm.weight,
+            nn.quantize(native, class_predicate=quantization)
+            weights = {}
+            for path in sorted(directory.glob("model-*.safetensors")):
+                shard = mx.load(str(path), stream=load_stream)
+                assert not weights.keys() & shard.keys(), f"Duplicate tensor in {path}"
+                weights.update(shard)
+            native.load_weights(list(native.sanitize(weights).items()), strict=True)
+            native.eval()
+            mx.eval(native.parameters())
+            self.native = native
+            self.embedding = native.model.embed_tokens
+            self.head = native.lm_head
+            self.norm = native.model.norm.weight
+            self.layers = []
+            for index, layer in enumerate(native.layers):
+                attention = layer.self_attn
+                a = SimpleNamespace(
+                    q=attention.q_proj,
+                    k=attention.k_proj,
+                    v=attention.v_proj,
+                    o=attention.o_proj,
+                    q_norm=attention.q_norm.weight,
+                    k_norm=attention.k_norm.weight,
+                    sinks=attention.softmax_offset.astype(mx.bfloat16),
+                    is_global=not attention.use_rope,
                 )
+                if index in self.config["mlp_only_layers"]:
+                    mlp = projections(layer.mlp)
+                else:
+                    mlp = projections(layer.mlp.switch_mlp)
+                    mlp.shared = projections(layer.mlp.shared_expert)
+                    mlp.router_weight = layer.mlp.gate.weight.astype(mx.float32)
+                    mlp.expert_bias = layer.mlp.gate.expert_bias.astype(mx.float32)
+                self.layers.append(
+                    SimpleNamespace(
+                        attention=a,
+                        mlp=mlp,
+                        input_norm=layer.input_layernorm.weight,
+                        post_norm=layer.post_attention_layernorm.weight,
+                    )
+                )
+            mx.eval(
+                [layer.attention.sinks for layer in self.layers],
+                [
+                    (layer.mlp.router_weight, layer.mlp.expert_bias)
+                    for layer in self.layers
+                    if hasattr(layer.mlp, "router_weight")
+                ],
             )
         self.config["quantization"] = dict(self.config["quantization"], mode="affine")
         self.eos_tokens = self.config["eos_token_id"]
