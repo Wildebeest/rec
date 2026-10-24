@@ -254,12 +254,16 @@ class Engine:
         try:
             preparation = self._prefix_preparation
             prefix = self._take_prefix(ids)
+            if preparation is not None and prefix is not preparation.cache:
+                preparation = None
             from .prefix import PrefillCancelled
 
             try:
-                logits = session.prefill(ids, prefix=prefix, should_stop=should_stop)
+                logits = session.prefill(
+                    ids, prefix=[prefix, prefix := None][0], should_stop=should_stop
+                )
             except PrefillCancelled:
-                if preparation is not None and prefix is preparation.cache:
+                if preparation is not None:
                     # Keep the original input anchor until a new request completes prefill.
                     self._prompt_cache = preparation.origin
                     preparation.cache = session.prompt_cache
@@ -267,7 +271,7 @@ class Engine:
                 else:
                     self._prompt_cache = session.prompt_cache
                 raise
-            del prefix, preparation
+            del preparation
             self._prompt_cache = session.prompt_cache
             text_stream = StreamingText(self.tokenizer)
             if sampling.presence_penalty:

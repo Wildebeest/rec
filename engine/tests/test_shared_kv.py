@@ -63,6 +63,17 @@ class SharedKVTests(unittest.TestCase):
         session.prefill([1] * (2 * BLOCK_TOKENS + 1))
         self.assertEqual(capacities, [BLOCK_TOKENS, 2 * BLOCK_TOKENS, 3 * BLOCK_TOKENS])
         self.assertEqual(session._state["capacity"], 3 * BLOCK_TOKENS)
+        first_storage = session.prompt_cache.storage
+        first_bank0 = first_storage.banks[0]
+        capacities.clear()
+        second = QATSession(engine, 1)
+        second.prefill([2] * 16, prefix=session.prompt_cache)
+        self.assertIs(second.prompt_cache.storage, first_storage)
+        self.assertIs(first_storage.banks[0], first_bank0)
+        self.assertEqual(capacities, [BLOCK_TOKENS])
+        self.assertEqual(second._state["capacity"], BLOCK_TOKENS)
+        self.assertEqual(first_storage.banks[1].shape, (1, 1024))
+        self.assertEqual(first_storage.banks[2].shape, (1, 1024))
 
     def test_packet_growth_and_limit(self):
         storage = self.storage()
