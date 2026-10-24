@@ -1119,6 +1119,20 @@ class FullModel:
                         name,
                         bank[offset : offset + x.nbytes].view(dtype).reshape(shape),
                     )
+            if hasattr(model, "native"):
+                for i in range(first, min(first + 4, 49)):
+                    nl = model.native.layers[i]
+                    ml = model.layers[i]
+                    nl.input_layernorm.weight = ml.input_norm
+                    nl.post_attention_layernorm.weight = ml.post_norm
+                    nl.self_attn.q_norm.weight = ml.attention.q_norm
+                    nl.self_attn.k_norm.weight = ml.attention.k_norm
+                    nl.self_attn.softmax_offset = ml.attention.sinks
+                    if hasattr(ml.mlp, "router_weight_bf16"):
+                        nl.mlp.gate.weight = ml.mlp.router_weight_bf16
+                        nl.mlp.gate.expert_bias = ml.mlp.expert_bias
+                if first == 48:
+                    model.native.model.norm.weight = model.norm
             self.banks.append(bank)
             entries.clear()
             del entries, pieces, x
