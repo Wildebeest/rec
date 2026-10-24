@@ -83,7 +83,10 @@ class PrefixRollbackTests(unittest.TestCase):
         self.assertEqual(common, 2)
         self.assertIs(restored, session.prompt_cache)
 
-    @unittest.skipUnless(mx.metal.is_available(), "requires Apple Metal")
+    @unittest.skipUnless(
+        mx.metal.is_available() or mx.device_info().get("architecture", "").startswith("sm_"),
+        "requires Apple Metal or CUDA",
+    )
     def test_generation_selects_prefix_once_before_cancelled_prefill(self):
         prefix = self.prefix()
         self.append(prefix, list(range(8)))

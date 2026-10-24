@@ -54,14 +54,21 @@ class Engine:
         context_limit: int,
         enforce_tool_schemas: bool = False,
     ):
-        if platform.system() != "Darwin" or platform.machine() != "arm64":
-            raise RuntimeError("Flint requires an Apple Silicon Mac")
-        memory = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True))
-        if memory < 48 * 1024**3:
-            raise RuntimeError("This build targets Macs with at least 48 GiB of memory")
         import mlx.core as mx
 
         device = mx.device_info()
+        is_cuda = device.get("architecture", "").startswith("sm_")
+        if is_cuda:
+            memory = int(device.get("total_memory", 0))
+            if memory < 30 * 1024**3:
+                raise RuntimeError("This CUDA build targets GPUs with at least 30 GiB of VRAM")
+        else:
+            if platform.system() != "Darwin" or platform.machine() != "arm64":
+                raise RuntimeError("Flint requires an Apple Silicon Mac or supported CUDA GPU")
+            memory = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True))
+            if memory < 48 * 1024**3:
+                raise RuntimeError("This build targets Macs with at least 48 GiB of memory")
+
         profile = profile_for_device(device)
         self.identity = validate(directory, manifest_path)
         config = json.loads((directory / "config.json").read_text())
@@ -91,8 +98,9 @@ class Engine:
         # Packing replaces native weights with lazy views. Materialize them on their creation
         # stream before HTTP threads use the native prefill model.
         mx.eval(self.runtime.model.native.parameters())
-        # Retain enough allocator cache to reuse the first 1.78-GiB KV block.
-        cache_limit = 2 * 1024**3
+        # Retain enough allocator cache to reuse the first 1.78-GiB KV block on Macs,
+        # or 512 MiB for decode scratch reuse on 32-GiB CUDA GPUs.
+        cache_limit = 512 * 1024**2 if is_cuda else 2 * 1024**3
         mx.set_cache_limit(cache_limit)
         self.startup = {
             "device": device,

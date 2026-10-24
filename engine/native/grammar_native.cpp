@@ -153,9 +153,15 @@ public:
 // before dispatching it. Only then may the CPU mask's GPU fence be encoded.
 // An alias alone would not insert that GPU buffer barrier.
 static mx::array handoff(const mx::array& mask, const mx::array& completed) {
+#ifdef __APPLE__
     static const auto barrier = mx::fast::metal_kernel(
         "xgrammar_forward_completed", {"completed"}, {"marker"},
         "marker[0] = uint(completed[0] != 0);");
+#else
+    static const auto barrier = mx::fast::cuda_kernel(
+        "xgrammar_forward_completed", {"completed"}, {"marker"},
+        "marker[0] = uint32_t(completed[0] != 0);");
+#endif
     auto stream = mx::default_stream(mx::Device::gpu);
     auto marker = barrier({completed}, {{1}}, {mx::uint32}, {1, 1, 1}, {1, 1, 1}, {},
                           std::nullopt, false, stream)[0];

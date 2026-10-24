@@ -51,7 +51,28 @@ def shared_projection(body, workers, groups):
         "uint head=member<8?kv_team*8+member:member==8?32+kv_team:36+kv_team;\n"
         "            uint local=head<32?head:head<36?head-32:head-36;\n"
     )
-    shared = f"""        uint kv_team=group/{groups},kv_member=group%{groups};
+    if workers >= 80:
+        shared = f"""        uint kv_team=group/{groups},kv_member=group%{groups};
+        for(uint unit=kv_member*8u+simdgroup_index_in_threadgroup;unit<320u;unit+={groups * 8}u) {{
+            uint member=unit/32u;
+            {heads}            Matrix m=weight_matrix(bank,d+(head<32?10:head<36?15:20));
+            m.w+=size_t(local)*128*1024;m.s+=local*128*32;m.b+=local*128*32;m.n=128;
+            q4_local_block<2048>(m,n,(head<32?q:head<36?k:v)+local*128,lane,(unit%32u)*4u);
+        }}
+        KV_TEAM_SYNC();
+        for(uint member=kv_member;member<10;member+={groups}) {{
+            {heads}            device bfloat16_t* out=(head<32?q:head<36?k:v)+local*128;
+{norm}
+            threadgroup_barrier(mem_flags::mem_device);
+            if(head>=32) {{
+                KVView target=head<36?keys:vals;
+                for(uint dim=tid;dim<128;dim+=256)target.store(local,insert,dim,out[dim]);
+            }}
+        }}
+        KV_TEAM_SYNC();
+        bool rounded="""
+    else:
+        shared = f"""        uint kv_team=group/{groups},kv_member=group%{groups};
         for(;;) {{
             uint ticket=0;
             if(lane==0)ticket=atomic_fetch_add_explicit(control+40+kv_team,1u,memory_order_relaxed);
@@ -123,7 +144,7 @@ def transform(header, body, workers=40):
     body = once(body, "uint phase=0;", "uint phase=0;uint kv_phase=0;")
     macro = "#define KV_TEAM_SYNC() if(!kv_team_sync(control,tid,kv_phase,ready,profile,group)){if(tid==0)diagnostic[group]=atomic_load_explicit(control+2,memory_order_relaxed);return;}"
     body = macro + "\n" + body
-    if groups >= 10:
+    if groups >= 10 and workers <= 76:
         body = once(
             body,
             f"for(uint work=group;work<40;work+={workers})",

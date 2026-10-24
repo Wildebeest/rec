@@ -36,7 +36,7 @@ HOST_LAYOUT = r"""{
       "routing",
       "uint32",
       [
-        1280,
+        2560,
         0,
         0,
         0
@@ -976,6 +976,20 @@ _BODY = r"""
 
 
 def _metal(name, *, source, header="", **options):
+    arch = mx.device_info().get("architecture", "")
+    if arch.startswith("sm_"):
+        from .cuda_compat import translate_msl_to_cuda
+
+        cuda_header, cuda_source = translate_msl_to_cuda(header, source)
+        identity = hashlib.sha256(repr((cuda_source, cuda_header, options)).encode()).hexdigest()
+        return mx.fast.cuda_kernel(
+            name=name + "_" + identity,
+            input_names=options["input_names"],
+            output_names=options["output_names"],
+            source=cuda_source,
+            header=cuda_header,
+            ensure_row_contiguous=options.get("ensure_row_contiguous", True),
+        )
     identity = hashlib.sha256(repr((source, header, options)).encode()).hexdigest()
     return mx.fast.metal_kernel(name=name + "_" + identity, source=source, header=header, **options)
 
@@ -988,7 +1002,11 @@ class FullModel:
         self.team_mlp_workers = mlp_workers
         self.workers = workers
         assert model.config["quantization"]["group_size"] == 64
-        assert mx.device_info()["architecture"] in ("applegpu_g16s", "applegpu_g17s")
+        assert mx.device_info()["architecture"] in (
+            "applegpu_g16s",
+            "applegpu_g17s",
+            "sm_120",
+        )
         assert len(model.layers) == 49 and model.config["hidden_size"] == 2048
         assert tuple(
             model.config[key]
@@ -1111,6 +1129,9 @@ class FullModel:
         gates = (gates << 16).view(mx.float32).astype(mx.bfloat16)
         self.silu = swiglu(gates, mx.ones_like(gates))
         mx.eval(self.silu)
+        if mx.device_info().get("architecture", "").startswith("sm_"):
+            mx.set_cache_limit(512 * 1024**2)
+            mx.clear_cache()
         self.set_schedule(
             workers=workers,
             attention=workers,
