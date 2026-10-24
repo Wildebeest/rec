@@ -1,14 +1,20 @@
 [build-system]
-requires = ["hatchling>=1.27,<2", "mlx==0.32.0", "nanobind==2.13.0"]
+requires = [
+    "hatchling>=1.27,<2",
+    "mlx==0.32.0; sys_platform == 'darwin'",
+    "mlx[cuda13]==0.32.0; sys_platform == 'linux'",
+    "nanobind==2.13.0",
+]
 build-backend = "hatchling.build"
 
 [project]
 name = "rec-mlx"
 version = "0.1.0"
-description = "Flint inference engine for Apple Silicon"
+description = "Flint inference engine for Apple Silicon and NVIDIA CUDA"
 requires-python = ">=3.12"
 dependencies = [
-    "mlx==0.32.0",
+    "mlx==0.32.0; sys_platform == 'darwin'",
+    "mlx[cuda13]==0.32.0; sys_platform == 'linux'",
     "mlx-lm==0.31.3",
     "transformers==5.16.1",
     "xgrammar==0.2.1",

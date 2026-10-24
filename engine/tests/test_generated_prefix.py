@@ -8,7 +8,10 @@ from rec_mlx.engine import Engine, Sampling
 from rec_mlx.prefix import PrefillCancelled, PromptCache
 
 
-@unittest.skipUnless(mx.metal.is_available(), "requires Apple Metal")
+@unittest.skipUnless(
+    mx.metal.is_available() or mx.device_info().get("architecture", "").startswith("sm_"),
+    "requires Apple Metal or CUDA",
+)
 class PreparedPrefixTests(unittest.TestCase):
     def engine(self):
         engine = Engine.__new__(Engine)

@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass
 
 
@@ -17,11 +18,24 @@ def profile_for_device(info):
         ("applegpu_g16s", "Apple M4 Pro"): "M4 Pro",
         ("applegpu_g17s", "Apple M5 Pro"): "M5 Pro",
         ("applegpu_g17s", "Apple M5 Max"): "M5 Max",
+        ("sm_120", "NVIDIA GeForce RTX 5090"): "RTX 5090",
     }
     architecture = info["architecture"]
     identity = (architecture, info["device_name"])
     if identity not in chips:
         raise ValueError(f"Unsupported resident kernel device: {identity}")
+    if chips[identity] == "RTX 5090":
+        workers = int(os.environ.get("REC_CUDA_WORKERS", "160"))
+        mlp_workers = int(os.environ.get("REC_CUDA_MLP_WORKERS", "128"))
+        head_workers = int(os.environ.get("REC_CUDA_HEAD_WORKERS", "160"))
+        return DeviceProfile(
+            chip=chips[identity],
+            architecture=architecture,
+            workers=workers,
+            mlp_workers=mlp_workers,
+            head_workers=head_workers,
+            prefill_chunk_size=512,
+        )
     if chips[identity] == "M5 Max":
         return DeviceProfile(
             chip=chips[identity],

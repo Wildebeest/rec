@@ -15,7 +15,10 @@ class SharedKVTests(unittest.TestCase):
             row[1] = index % 4 == 0
         return KVStorage(metadata, capacity)
 
-    @unittest.skipUnless(mx.metal.is_available(), "requires Apple Metal")
+    @unittest.skipUnless(
+        mx.metal.is_available() or mx.device_info().get("architecture", "").startswith("sm_"),
+        "requires Apple Metal or CUDA",
+    )
     def test_native_views_follow_shared_writes_and_growth(self):
         storage = self.storage()
         cache = FixedKVCache(storage, 0)
