@@ -177,6 +177,8 @@ class FixedKVCache:
     def make_mask(self, n_tokens: int, window_size=None, return_array: bool = False):
         if n_tokens == 1 and not return_array:
             return None
+        if window_size is None and not return_array:
+            return "causal"
         return create_causal_mask(n_tokens, offset=self.offset, window_size=window_size)
 
     def update_and_fetch(self, keys: mx.array, values: mx.array):
