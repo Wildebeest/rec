@@ -1,10 +1,15 @@
+import gc
 import hashlib
 import json
+import logging
+import os
 import platform
 import resource
+import socket
 import subprocess
 import threading
 import time
+import urllib.request
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +18,45 @@ from .chat import load_tokenizer, normalize_messages
 from .checkpoint import validate
 from .detokenize import StreamingText
 from .kernels.device import profile_for_device
+
+
+def _evict_goon_gpu_workers() -> None:
+    sock_path = os.environ.get("GOON_BRIDGE_SOCKET")
+    if not sock_path:
+        runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+        sock_path = f"{runtime_dir}/goon/python-bridge.sock"
+    if os.path.exists(sock_path):
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(5.0)
+                sock.connect(sock_path)
+                payload = (
+                    json.dumps(
+                        {
+                            "type": "stop_worker",
+                            "request_id": "flint_wake",
+                            "reason": "flint_wake",
+                        }
+                    )
+                    + "\n"
+                ).encode()
+                sock.sendall(payload)
+                sock.recv(4096)
+        except OSError as error:
+            logging.debug("Could not evict goon-python-bridge worker: %s", error)
+    comfy_free_url = os.environ.get("COMFYUI_FREE_URL", "http://127.0.0.1:8188/free")
+    if comfy_free_url:
+        try:
+            req = urllib.request.Request(
+                comfy_free_url,
+                data=b'{"unload_models":true,"free_memory":true}',
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=1.0):
+                pass
+        except OSError:
+            pass
 
 
 class ContextLimitError(ValueError):
@@ -46,6 +90,8 @@ class Sampling:
 
 
 class Engine:
+    sleeping: bool = False
+
     def __init__(
         self,
         directory: Path,
@@ -79,6 +125,7 @@ class Engine:
             raise ValueError("Manifest context limit does not match the engine capacity")
         if not 1 <= context_limit <= QATModel.context_limit:
             raise ValueError(f"Context limit must be between 1 and {QATModel.context_limit} tokens")
+        self.directory = directory
         self.context_limit = context_limit
         self._prompt_cache = None
         self._prefix_preparation = None
@@ -87,9 +134,13 @@ class Engine:
         self._constraints = None
         self.enforce_tool_schemas = enforce_tool_schemas
         self._constraints_lock = threading.Lock()
+        self._sleep_lock = threading.Lock()
+        self.sleeping = False
         self.eos = set(config["eos_token_id"])
         if not self.eos:
             raise ValueError("Checkpoint has no EOS tokens")
+        if is_cuda:
+            _evict_goon_gpu_workers()
         start = time.perf_counter()
         mx.set_cache_limit(0)
         mx.clear_cache()
@@ -101,6 +152,7 @@ class Engine:
         # Retain enough allocator cache to reuse the first 1.78-GiB KV block on Macs,
         # or 512 MiB for decode scratch reuse on 32-GiB CUDA GPUs.
         cache_limit = 512 * 1024**2 if is_cuda else 2 * 1024**3
+        self._cache_limit = cache_limit
         mx.set_cache_limit(cache_limit)
         self.startup = {
             "device": device,
@@ -149,6 +201,43 @@ class Engine:
         finally:
             events.close()
 
+    def sleep(self) -> bool:
+        with self._sleep_lock:
+            if self.sleeping:
+                return False
+            self._prompt_cache = None
+            self._prefix_preparation = None
+            self.resident_sampler = None
+            self.runtime = None
+            self.sleeping = True
+            gc.collect()
+            self.mx.synchronize()
+            self.mx.set_cache_limit(0)
+            self.mx.clear_cache()
+            logging.info("Engine entered sleep mode; GPU weights and KV cache released")
+            return True
+
+    def wake(self) -> bool:
+        with self._sleep_lock:
+            if not self.sleeping:
+                return False
+            from .kernels import build_decoder
+            from .quantized import QATModel
+
+            _evict_goon_gpu_workers()
+            start = time.perf_counter()
+            mx = self.mx
+            mx.set_cache_limit(0)
+            mx.clear_cache()
+            self.runtime, self.resident_sampler = build_decoder(
+                QATModel(self.directory), optimized=True, skip_guards=True
+            )
+            mx.eval(self.runtime.model.native.parameters())
+            mx.set_cache_limit(self._cache_limit)
+            self.sleeping = False
+            logging.info("Engine woke from sleep in %.2fs", time.perf_counter() - start)
+            return True
+
     def generate_tokens(
         self,
         ids,
@@ -160,6 +249,8 @@ class Engine:
     ):
         # Metal streams are thread-local; HTTP handlers run outside the model-loading thread.
         with self.mx.stream(self.mx.new_stream(self.mx.gpu)):
+            if self.sleeping:
+                self.wake()
             from .prefix import PrefillCancelled
 
             try:
@@ -176,6 +267,8 @@ class Engine:
                 self.mx.clear_cache()
 
     def prepare_prefix(self, *, should_stop=lambda: False):
+        if self.sleeping:
+            return None
         from .prefix import PrefillCancelled
 
         pending = self._prefix_preparation

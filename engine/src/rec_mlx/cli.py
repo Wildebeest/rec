@@ -86,6 +86,12 @@ def main():
         default=True,
         help="use MLX fast CPU/GPU synchronization (default: enabled)",
     )
+    parser.add_argument(
+        "--sleep-idle-seconds",
+        type=float,
+        default=0.0,
+        help="release GPU weights and KV cache after this many idle seconds in serve mode (default: disabled)",
+    )
     args = parser.parse_args()
     os.environ["MLX_METAL_FAST_SYNCH"] = "1" if args.fast_sync else "0"
     try:
@@ -133,6 +139,7 @@ def main():
             defaults=settings,
             api_key=api_key,
             grammar_mode=args.grammar,
+            sleep_idle_seconds=args.sleep_idle_seconds,
         )
         print(f"Listening on http://{args.host}:{server.server_port}/v1", flush=True)
 
