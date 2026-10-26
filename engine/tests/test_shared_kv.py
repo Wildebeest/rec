@@ -1,10 +1,17 @@
+import threading
 import unittest
+import weakref
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import mlx.core as mx
+from mlx_lm.models.base import create_causal_mask
 
 from rec_mlx.cache import BLOCK_TOKENS, FixedKVCache, KVStorage
+from rec_mlx.engine import Engine, Sampling
 from rec_mlx.kernels.megakernel import FullModel
+from rec_mlx.model import FlintTransformer, ModelArgs
+from rec_mlx.prefix import PrefillCancelled, PrefixPreparation, PromptCache
 from rec_mlx.quantized import QATSession
 
 
@@ -36,6 +43,22 @@ class SharedKVTests(unittest.TestCase):
         self.assertTrue(mx.array_equal(actual[0][:, :, BLOCK_TOKENS - 2 :], keys).item())
         self.assertTrue(mx.array_equal(actual[1][:, :, BLOCK_TOKENS - 2 :], values).item())
 
+    def test_fixed_kv_cache_make_mask_is_causal(self):
+        cache = FixedKVCache(self.storage(), 0)
+        self.assertIsNone(cache.make_mask(1))
+        self.assertEqual(cache.make_mask(3), "causal")
+        self.assertTrue(
+            mx.array_equal(cache.make_mask(3, return_array=True), create_causal_mask(3)).item()
+        )
+        cache.offset = 2
+        self.assertEqual(cache.make_mask(3), "causal")
+        self.assertTrue(
+            mx.array_equal(
+                cache.make_mask(3, window_size=4, return_array=True),
+                create_causal_mask(3, offset=2, window_size=4),
+            ).item()
+        )
+
     def test_prefill_allocates_only_the_current_chunk(self):
         metadata = [[0] * 64 for _ in range(50)]
         metadata[0][1] = 1
@@ -60,6 +83,17 @@ class SharedKVTests(unittest.TestCase):
         session.prefill([1] * (2 * BLOCK_TOKENS + 1))
         self.assertEqual(capacities, [BLOCK_TOKENS, 2 * BLOCK_TOKENS, 3 * BLOCK_TOKENS])
         self.assertEqual(session._state["capacity"], 3 * BLOCK_TOKENS)
+        first_storage = session.prompt_cache.storage
+        first_bank0 = first_storage.banks[0]
+        capacities.clear()
+        second = QATSession(engine, 1)
+        second.prefill([2] * 16, prefix=session.prompt_cache)
+        self.assertIs(second.prompt_cache.storage, first_storage)
+        self.assertIs(first_storage.banks[0], first_bank0)
+        self.assertEqual(capacities, [BLOCK_TOKENS])
+        self.assertEqual(second._state["capacity"], BLOCK_TOKENS)
+        self.assertEqual(first_storage.banks[1].shape, (1, 1024))
+        self.assertEqual(first_storage.banks[2].shape, (1, 1024))
 
     def test_packet_growth_and_limit(self):
         storage = self.storage()
@@ -77,6 +111,140 @@ class SharedKVTests(unittest.TestCase):
         state["usable"] = False
         with self.assertRaisesRegex(RuntimeError, "invalidated"):
             FullModel.ensure_capacity(engine, state, 1)
+
+
+class EngineMemoryTests(unittest.TestCase):
+    def make_engine(self):
+        engine = Engine.__new__(Engine)
+        engine.mx = mx
+        engine._local = threading.local()
+        engine.context_limit = 64
+        engine.eos = {0}
+        engine._prompt_cache = None
+        engine._prefix_preparation = None
+        return engine
+
+    def storage(self, capacity=17):
+        metadata = [[0] * 64 for _ in range(50)]
+        for index, row in enumerate(metadata[:49]):
+            row[1] = index % 4 == 0
+        return KVStorage(metadata, capacity)
+
+    def test_engine_reuses_thread_local_gpu_stream(self):
+        engine = self.make_engine()
+        first = engine._gpu_stream()
+        self.assertIs(engine._gpu_stream(), first)
+
+        def stub_generate_tokens(
+            ids, sampling, *, should_stop, grammar=None, return_logprobs=False
+        ):
+            return iter([])
+
+        engine._generate_tokens = stub_generate_tokens
+        sampling = Sampling(temperature=0, max_tokens=1)
+        list(engine.generate_tokens([1, 2, 3], sampling, should_stop=lambda: False))
+        list(engine.generate_tokens([4, 5], sampling, should_stop=lambda: False))
+        self.assertIs(engine._local.stream, first)
+
+        stream = {}
+
+        def worker():
+            stream["value"] = engine._gpu_stream()
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join()
+        self.assertIsNot(stream["value"], first)
+
+    def test_engine_drops_stale_prefix_preparation_before_prefill(self):
+        engine = self.make_engine()
+        engine.tokenizer = SimpleNamespace(
+            backend_tokenizer=None, decode=lambda tokens, skip_special_tokens=False: ""
+        )
+        engine._prompt_cache = PromptCache(
+            tokens=[9, 9, 9],
+            layers=[SimpleNamespace(nbytes=0) for _ in range(49)],
+            logits=None,
+            storage=object(),
+        )
+        weak = weakref.ref(engine._prompt_cache)
+        session = SimpleNamespace(
+            prompt_cache=None,
+            _state={
+                "kv": SimpleNamespace(nbytes=0),
+                "capacity": 0,
+                "growth_count": 0,
+                "growth_seconds": 0,
+            },
+            cached_tokens=0,
+            common_prefix_tokens=0,
+            calls=[],
+        )
+
+        def prefill(
+            tokens, *, prefix=None, should_stop=lambda: False, interrupt_between_layers=False
+        ):
+            had_prefix = prefix is not None
+            prefix = None
+            self.assertIsNone(weak())
+            session.calls.append((list(tokens), had_prefix))
+            session.prompt_cache = SimpleNamespace(
+                tokens=[9, 9, 9],
+                layers=[SimpleNamespace(nbytes=0) for _ in range(49)],
+                logits=None,
+                checkpoint_bytes=0,
+            )
+            raise PrefillCancelled()
+
+        session.prefill = prefill
+        engine.runtime = SimpleNamespace(
+            make_session=lambda **kwargs: session,
+            prefill_chunk_size=2,
+            metadata=[[0] * 64 for _ in range(50)],
+        )
+        preparation = engine._prefix_preparation = PrefixPreparation(
+            origin=SimpleNamespace(tokens=[1, 2, 3]),
+            tokens=[1, 2, 3, 4, 5],
+            cache=SimpleNamespace(tokens=[1, 2, 3, 4, 5], checkpoints=[]),
+        )
+        sampling = Sampling(temperature=0, max_tokens=1)
+        self.assertEqual(
+            list(engine.generate_tokens([9, 9, 9], sampling, should_stop=lambda: False)), []
+        )
+        self.assertEqual(session.calls, [([9, 9, 9], True)])
+        self.assertIsNone(engine._prefix_preparation)
+        self.assertIs(engine._prompt_cache, session.prompt_cache)
+        self.assertIsNot(engine._prompt_cache, preparation.origin)
+
+    def test_flint_transformer_evaluates_each_layer_during_prefill(self):
+        model = FlintTransformer(
+            ModelArgs(
+                num_hidden_layers=2,
+                hidden_size=512,
+                intermediate_size=128,
+                moe_intermediate_size=32,
+                shared_expert_intermediate_size=32,
+                num_attention_heads=4,
+                num_key_value_heads=4,
+                head_dim=128,
+                num_experts=4,
+                num_experts_per_tok=2,
+                mlp_only_layers=[0],
+                layer_types=["full_attention", "sliding_attention"],
+                vocab_size=128,
+            )
+        )
+        storage = self.storage()
+        caches = [FixedKVCache(storage, index) for index in range(len(model.layers))]
+        with patch("mlx.core.eval") as eval_spy:
+            model(
+                None,
+                cache=caches,
+                input_embeddings=mx.zeros((1, 2, model.args.hidden_size)),
+                should_stop=None,
+            )
+        evaluated = [call for call in eval_spy.call_args_list if len(call.args) == 2]
+        self.assertEqual(len(evaluated), len(model.layers))
 
 
 if __name__ == "__main__":
