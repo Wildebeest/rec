@@ -147,7 +147,8 @@ inline bool sync_all(device atomic_uint* control,uint tid,thread uint& phase,
         }
         uint spins=0;
         while(atomic_load_explicit(control+1,memory_order_relaxed)==phase &&
-              atomic_load_explicit(control+2,memory_order_relaxed)==0 && spins<10000000) ++spins;
+              atomic_load_explicit(control+2,memory_order_relaxed)==0 && spins<10000000)
+            if((spins++&63u)==0u)atomic_thread_fence(mem_flags::mem_device,memory_order_seq_cst,thread_scope_device);
         if(__PROFILE__) {uint at=(phase*__WORKERS__+group)*2;profile[at]=spins;profile[at+1]=arrived;}
         ready[0]=uint(atomic_load_explicit(control+1,memory_order_relaxed)>phase);
         if(!ready[0])atomic_store_explicit(control+2,phase+1,memory_order_relaxed);
@@ -808,7 +809,8 @@ inline bool expert_team_handoff(device uint* routing,device atomic_uint* control
         for(uint peer=first;peer<first+count;++peer) {
             uint spins=0;
             while(atomic_load_explicit((device atomic_uint*)(routing+peer*16+14),memory_order_relaxed)<layer+1 &&
-                  atomic_load_explicit(control+2,memory_order_relaxed)==0 && spins<10000000) ++spins;
+                  atomic_load_explicit(control+2,memory_order_relaxed)==0 && spins<10000000)
+                if((spins++&63u)==0u)atomic_thread_fence(mem_flags::mem_device,memory_order_seq_cst,thread_scope_device);
             complete=complete && atomic_load_explicit((device atomic_uint*)(routing+peer*16+14),memory_order_relaxed)>=layer+1;
         }
         ready[0]=uint(complete && atomic_load_explicit(control+2,memory_order_relaxed)==0);
@@ -990,6 +992,8 @@ def _metal(name, *, source, header="", **options):
             header=cuda_header,
             ensure_row_contiguous=options.get("ensure_row_contiguous", True),
         )
+    if arch == "applegpu_g13s":
+        header = "#define device coherent device\n" + header
     identity = hashlib.sha256(repr((source, header, options)).encode()).hexdigest()
     return mx.fast.metal_kernel(name=name + "_" + identity, source=source, header=header, **options)
 
@@ -1003,6 +1007,7 @@ class FullModel:
         self.workers = workers
         assert model.config["quantization"]["group_size"] == 64
         assert mx.device_info()["architecture"] in (
+            "applegpu_g13s",
             "applegpu_g16s",
             "applegpu_g17s",
             "sm_120",
