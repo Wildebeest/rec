@@ -1,5 +1,8 @@
+import gc
 import hashlib
 import json
+import logging
+import os
 import platform
 import resource
 import subprocess
@@ -13,6 +16,16 @@ from .chat import load_tokenizer, normalize_messages
 from .checkpoint import validate
 from .detokenize import StreamingText
 from .kernels.device import profile_for_device
+
+
+def _run_wake_hook() -> None:
+    command = os.environ.get("FLINT_WAKE_COMMAND")
+    if not command:
+        return
+    try:
+        subprocess.run(command, shell=True, check=False, timeout=5.0)
+    except (OSError, subprocess.SubprocessError):
+        logging.debug("GPU wake command failed or timed out", exc_info=True)
 
 
 class ContextLimitError(ValueError):
@@ -46,6 +59,8 @@ class Sampling:
 
 
 class Engine:
+    sleeping: bool = False
+
     def __init__(
         self,
         directory: Path,
@@ -72,6 +87,7 @@ class Engine:
             raise ValueError("Manifest context limit does not match the engine capacity")
         if not 1 <= context_limit <= QATModel.context_limit:
             raise ValueError(f"Context limit must be between 1 and {QATModel.context_limit} tokens")
+        self.directory = directory
         self.context_limit = context_limit
         self._prompt_cache = None
         self._prefix_preparation = None
@@ -80,6 +96,8 @@ class Engine:
         self._constraints = None
         self.enforce_tool_schemas = enforce_tool_schemas
         self._constraints_lock = threading.Lock()
+        self._sleep_lock = threading.Lock()
+        self.sleeping = False
         self.eos = set(config["eos_token_id"])
         if not self.eos:
             raise ValueError("Checkpoint has no EOS tokens")
@@ -93,6 +111,7 @@ class Engine:
         mx.eval(self.runtime.model.native.parameters())
         # Retain enough allocator cache to reuse the first 1.78-GiB KV block.
         cache_limit = 2 * 1024**3
+        self._cache_limit = cache_limit
         mx.set_cache_limit(cache_limit)
         self.startup = {
             "device": device,
@@ -141,6 +160,43 @@ class Engine:
         finally:
             events.close()
 
+    def sleep(self) -> bool:
+        with self._sleep_lock:
+            if self.sleeping:
+                return False
+            self._prompt_cache = None
+            self._prefix_preparation = None
+            self.resident_sampler = None
+            self.runtime = None
+            self.sleeping = True
+            gc.collect()
+            self.mx.synchronize()
+            self.mx.set_cache_limit(0)
+            self.mx.clear_cache()
+            logging.info("Engine entered sleep mode; GPU weights and KV cache released")
+            return True
+
+    def wake(self) -> bool:
+        with self._sleep_lock:
+            if not self.sleeping:
+                return False
+            from .kernels import build_decoder
+            from .quantized import QATModel
+
+            _run_wake_hook()
+            start = time.perf_counter()
+            mx = self.mx
+            mx.set_cache_limit(0)
+            mx.clear_cache()
+            self.runtime, self.resident_sampler = build_decoder(
+                QATModel(self.directory), optimized=True, skip_guards=True
+            )
+            mx.eval(self.runtime.model.native.parameters())
+            mx.set_cache_limit(self._cache_limit)
+            self.sleeping = False
+            logging.info("Engine woke from sleep in %.2fs", time.perf_counter() - start)
+            return True
+
     def generate_tokens(
         self,
         ids,
@@ -152,6 +208,8 @@ class Engine:
     ):
         # Metal streams are thread-local; HTTP handlers run outside the model-loading thread.
         with self.mx.stream(self.mx.new_stream(self.mx.gpu)):
+            if self.sleeping:
+                self.wake()
             from .prefix import PrefillCancelled
 
             try:
@@ -168,6 +226,8 @@ class Engine:
                 self.mx.clear_cache()
 
     def prepare_prefix(self, *, should_stop=lambda: False):
+        if self.sleeping:
+            return None
         from .prefix import PrefillCancelled
 
         pending = self._prefix_preparation

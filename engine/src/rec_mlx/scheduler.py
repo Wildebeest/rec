@@ -1,6 +1,7 @@
 import json
 import sys
 import threading
+import time
 from dataclasses import asdict
 from queue import Empty, Queue
 from types import SimpleNamespace
@@ -33,10 +34,12 @@ class ModelProvider:
 
 
 class Generator(ResponseGenerator):
-    def __init__(self, engine, metrics_path, defaults):
+    def __init__(self, engine, metrics_path, defaults, *, sleep_idle_seconds: float = 0.0):
         self.engine = engine
         self.metrics_path = metrics_path
         self.defaults = defaults
+        self.sleep_idle_seconds = sleep_idle_seconds
+        self.last_active = time.monotonic()
         self.tokenizer = TokenizerWrapper(
             engine.tokenizer,
             NaiveStreamingDetokenizer,
@@ -57,8 +60,39 @@ class Generator(ResponseGenerator):
         self.stopping = threading.Event()
         self.busy = threading.Event()
         self._request_lock = threading.Lock()
+        self._gpu_lock = threading.Lock()
         self.active_context = None
         super().__init__(ModelProvider(engine, self.tokenizer, cli_args), prompt_cache=None)
+        if self.sleep_idle_seconds > 0:
+            self._idle_thread = threading.Thread(target=self._idle_loop, daemon=True)
+            self._idle_thread.start()
+
+    def _idle_loop(self):
+        interval = min(1.0, max(0.05, self.sleep_idle_seconds / 4))
+        while not self.stopping.wait(interval):
+            if getattr(self.engine, "sleeping", False):
+                continue
+            if self.busy.is_set() or not self.requests.empty():
+                self.last_active = time.monotonic()
+                continue
+            if time.monotonic() - self.last_active >= self.sleep_idle_seconds:
+                self.sleep_if_idle()
+
+    def sleep_if_idle(self) -> dict:
+        if not self._gpu_lock.acquire(blocking=False):
+            return {"sleeping": bool(getattr(self.engine, "sleeping", False)), "busy": True}
+        try:
+            if self.busy.is_set() or not self.requests.empty():
+                return {"sleeping": bool(getattr(self.engine, "sleeping", False)), "busy": True}
+            sleep_fn = getattr(self.engine, "sleep", None)
+            changed = bool(sleep_fn()) if sleep_fn is not None else False
+            return {
+                "sleeping": bool(getattr(self.engine, "sleeping", False)),
+                "changed": changed,
+                "busy": False,
+            }
+        finally:
+            self._gpu_lock.release()
 
     def cancel(self):
         with self._request_lock:
@@ -104,36 +138,39 @@ class Generator(ResponseGenerator):
 
     def _serve_single(self, queued_request):
         response_queue, request, args = queued_request
-        try:
-            if self.stopping.is_set():
-                response_queue.put(RuntimeError("The server is stopping"))
-                return
-            if request.is_disconnected():
-                response_queue.put(ConnectionAbortedError("Client disconnected while queued"))
-                return
-            self.busy.set()
-            ctx, responses = self._start_request(request, args)
-            response_queue.put(ctx)
+        with self._gpu_lock:
             try:
-                for response in responses:
-                    response_queue.put(response)
+                if self.stopping.is_set():
+                    response_queue.put(RuntimeError("The server is stopping"))
+                    return
+                if request.is_disconnected():
+                    response_queue.put(ConnectionAbortedError("Client disconnected while queued"))
+                    return
+                self.busy.set()
+                ctx, responses = self._start_request(request, args)
+                response_queue.put(ctx)
+                try:
+                    for response in responses:
+                        response_queue.put(response)
+                finally:
+                    responses.close()
+                response_queue.put(None)
             finally:
-                responses.close()
-            response_queue.put(None)
-        finally:
-            error = sys.exception()
-            if error is not None:
-                response_queue.put(error)
-            self.active_context = None
-            self.busy.clear()
-        # Must run on this serialized GPU worker; a queued request interrupts it between layers.
-        self.busy.set()
-        try:
-            self.engine.prepare_prefix(
-                should_stop=lambda: self.stopping.is_set() or not self.requests.empty()
-            )
-        finally:
-            self.busy.clear()
+                error = sys.exception()
+                if error is not None:
+                    response_queue.put(error)
+                self.active_context = None
+                self.last_active = time.monotonic()
+                self.busy.clear()
+            # Must run on this serialized GPU worker; a queued request interrupts it between layers.
+            self.busy.set()
+            try:
+                self.engine.prepare_prefix(
+                    should_stop=lambda: self.stopping.is_set() or not self.requests.empty()
+                )
+            finally:
+                self.last_active = time.monotonic()
+                self.busy.clear()
 
     def _start_request(self, request, args):
         sampling = Sampling(

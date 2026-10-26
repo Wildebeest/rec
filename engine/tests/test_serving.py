@@ -47,6 +47,19 @@ class Engine:
         self.constraint = SimpleNamespace(stops=(0,))
         self.constraints = SimpleNamespace(tools=Mock(return_value=self.constraint))
         self.grammars = []
+        self.sleeping = False
+
+    def sleep(self):
+        if self.sleeping:
+            return False
+        self.sleeping = True
+        return True
+
+    def wake(self):
+        if not self.sleeping:
+            return False
+        self.sleeping = False
+        return True
 
     def prepare_prefix(self, *, should_stop):
         return None
@@ -55,6 +68,8 @@ class Engine:
         return [ord(c) for c in messages[-1]["content"]]
 
     def generate_tokens(self, ids, sampling, *, should_stop, return_logprobs=False, grammar=None):
+        if self.sleeping:
+            self.wake()
         self.calls.append((chr(ids[0]), sampling.max_tokens))
         self.grammars.append(grammar)
         self.active += 1
@@ -335,6 +350,39 @@ class ServingTest(unittest.TestCase):
         ) as generate:
             self.assertEqual(self.request("B", max_tokens=1, presence_penalty=1.5)[0], 200)
             self.assertEqual(generate.call_args.args[1].presence_penalty, 1.5)
+
+    def test_sleep_endpoint_and_auto_wake(self):
+        conn = http.client.HTTPConnection(*self.server.server_address, timeout=5)
+        try:
+            conn.request("POST", "/sleep")
+            response = conn.getresponse()
+            body = json.loads(response.read())
+            self.assertEqual(response.status, 200)
+            self.assertEqual(body, {"sleeping": True, "changed": True, "busy": False})
+
+            conn.request("GET", "/health")
+            health = json.loads(conn.getresponse().read())
+            self.assertTrue(health["sleeping"])
+        finally:
+            conn.close()
+
+        status, _ = self.request("B", max_tokens=1)
+        self.assertEqual(status, 200)
+        self.assertFalse(self.engine.sleeping)
+
+        first = self.pool.submit(self.request, "A", max_tokens=1)
+        self.assertTrue(self.engine.started.wait(3))
+        conn = http.client.HTTPConnection(*self.server.server_address, timeout=5)
+        try:
+            conn.request("POST", "/sleep")
+            response = conn.getresponse()
+            body = json.loads(response.read())
+            self.assertEqual(response.status, 409)
+            self.assertEqual(body, {"sleeping": False, "busy": True})
+        finally:
+            conn.close()
+        self.engine.release.set()
+        self.assertEqual(first.result()[0], 200)
 
 
 if __name__ == "__main__":

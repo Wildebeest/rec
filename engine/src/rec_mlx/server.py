@@ -15,7 +15,14 @@ class RequestError(ValueError):
 
 
 def make_server(
-    engine, address, metrics_path, *, defaults=Sampling(), api_key=None, grammar_mode="flint"
+    engine,
+    address,
+    metrics_path,
+    *,
+    defaults=Sampling(),
+    api_key=None,
+    grammar_mode="flint",
+    sleep_idle_seconds: float = 0.0,
 ):
     from mlx_lm.server import APIHandler
 
@@ -59,6 +66,7 @@ def make_server(
                         "status": "stopping" if stopping else "ready",
                         "busy": generator.busy.is_set(),
                         "queued": generator.requests.qsize(),
+                        "sleeping": bool(getattr(engine, "sleeping", False)),
                     },
                 )
             elif self.path == "/v1/models":
@@ -68,6 +76,13 @@ def make_server(
 
         def do_POST(self):
             if not self.authenticated():
+                return
+            if self.path == "/sleep":
+                if generator.stopping.is_set():
+                    self.reply(503, {"error": "The server is stopping"})
+                    return
+                result = generator.sleep_if_idle()
+                self.reply(409 if result["busy"] else 200, result)
                 return
             if self.path != "/v1/chat/completions":
                 self.reply(404, {"error": "Unknown endpoint"})
@@ -273,7 +288,18 @@ def make_server(
                 if request.generation_context is not None:
                     request.generation_context.stop()
 
-    server = ThreadingHTTPServer(address, Handler)
-    generator = Generator(engine, metrics_path, defaults)
+    if address[0] in ("0.0.0.0", "::"):
+
+        class DualStackHTTPServer(ThreadingHTTPServer):
+            address_family = socket.AF_INET6
+
+            def server_bind(self):
+                self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+                return super().server_bind()
+
+        server = DualStackHTTPServer(("::", address[1]), Handler)
+    else:
+        server = ThreadingHTTPServer(address, Handler)
+    generator = Generator(engine, metrics_path, defaults, sleep_idle_seconds=sleep_idle_seconds)
     server.generator = generator
     return server

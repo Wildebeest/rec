@@ -33,6 +33,11 @@ def main():
         help="total input and output tokens (default: %(default)s)",
     )
     parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="bind address for serve (default: %(default)s)",
+    )
+    parser.add_argument(
         "--port", type=int, default=8080, help="loopback port for serve (default: %(default)s)"
     )
     parser.add_argument(
@@ -81,6 +86,12 @@ def main():
         default=True,
         help="use MLX fast CPU/GPU synchronization (default: enabled)",
     )
+    parser.add_argument(
+        "--sleep-idle-seconds",
+        type=float,
+        default=0.0,
+        help="release GPU weights and KV cache after this many idle seconds in serve mode (default: disabled)",
+    )
     args = parser.parse_args()
     os.environ["MLX_METAL_FAST_SYNCH"] = "1" if args.fast_sync else "0"
     try:
@@ -123,13 +134,14 @@ def main():
 
         server = make_server(
             engine,
-            ("127.0.0.1", args.port),
+            (args.host, args.port),
             args.metrics,
             defaults=settings,
             api_key=api_key,
             grammar_mode=args.grammar,
+            sleep_idle_seconds=args.sleep_idle_seconds,
         )
-        print(f"Listening on http://127.0.0.1:{server.server_port}/v1", flush=True)
+        print(f"Listening on http://{args.host}:{server.server_port}/v1", flush=True)
 
         def stop(signum, frame):
             server.generator.cancel()
