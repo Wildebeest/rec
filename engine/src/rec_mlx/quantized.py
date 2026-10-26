@@ -129,6 +129,7 @@ class QATSession:
                     entry.grow(len(tokens))
                     mx.eval(entry.state)
         else:
+            mx.synchronize()
             mx.clear_cache()
             state = self.engine.prefill_state(capacity, limit=limit, storage=prior_storage)
             cache = self.engine.model.make_cache(len(tokens), state["kv"])
@@ -150,6 +151,7 @@ class QATSession:
             logits = native.lm_head(hidden[:, -1:])
             mx.eval(logits, [entry.state for entry in cache])
             if end > 32768:
+                mx.synchronize()
                 mx.clear_cache()
             self.prompt_cache.advance(tokens[begin:end], logits)
         if should_stop():

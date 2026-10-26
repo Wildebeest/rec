@@ -115,6 +115,7 @@ class KVStorage:
         count = (capacity + BLOCK_TOKENS - 1) // BLOCK_TOKENS
         start = self.capacity // BLOCK_TOKENS
         if count > start:
+            mx.synchronize()
             mx.clear_cache()
         for index in range(start, count):
             size = self.global_elements + (self.local_elements if index == 0 else 0)
@@ -131,6 +132,7 @@ class KVStorage:
                 self.banks[index] = mx.zeros((1, 1024), mx.bfloat16)
                 mx.eval(self.banks[index])
             self.capacity = count * BLOCK_TOKENS
+            mx.synchronize()
             mx.clear_cache()
 
     def layer(self, index, count=None):

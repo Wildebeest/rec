@@ -129,6 +129,7 @@ class Engine:
         self.context_limit = context_limit
         self._prompt_cache = None
         self._prefix_preparation = None
+        self._local = threading.local()
         self.mx = mx
         self.tokenizer = load_tokenizer(directory)
         self._constraints = None
@@ -238,6 +239,17 @@ class Engine:
             logging.info("Engine woke from sleep in %.2fs", time.perf_counter() - start)
             return True
 
+    def _gpu_stream(self):
+        # Metal streams are thread-local; HTTP handlers run outside the model-loading thread.
+        local = getattr(self, "_local", None)
+        if local is None:
+            local = self._local = threading.local()
+        stream = getattr(local, "stream", None)
+        if stream is None:
+            stream = self.mx.new_stream(self.mx.gpu)
+            local.stream = stream
+        return stream
+
     def generate_tokens(
         self,
         ids,
@@ -248,7 +260,7 @@ class Engine:
         return_logprobs=False,
     ):
         # Metal streams are thread-local; HTTP handlers run outside the model-loading thread.
-        with self.mx.stream(self.mx.new_stream(self.mx.gpu)):
+        with self.mx.stream(self._gpu_stream()):
             if self.sleeping:
                 self.wake()
             from .prefix import PrefillCancelled
@@ -280,7 +292,7 @@ class Engine:
         end = origin + (len(pending.tokens) - origin) // chunk * chunk
         start = time.perf_counter()
         prepared = 0
-        with mx.stream(mx.new_stream(mx.gpu)):
+        with mx.stream(self._gpu_stream()):
             while (origin if pending.cache is None else len(pending.cache.tokens)) < end:
                 if should_stop():
                     break
