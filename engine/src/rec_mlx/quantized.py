@@ -149,7 +149,7 @@ class QATSession:
             )
             logits = native.lm_head(hidden[:, -1:])
             mx.eval(logits, [entry.state for entry in cache])
-            if end > 65536:
+            if end > 32768:
                 mx.clear_cache()
             self.prompt_cache.advance(tokens[begin:end], logits)
         if should_stop():
