@@ -1,4 +1,5 @@
 import json
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -22,8 +23,7 @@ class QATModel:
         assert export["bits"] == 4 and export["routed_expert_bits"] in (3, 4)
         assert export["embedding_bits"] == 8
         use_cpu_staging = mx.device_info().get("architecture", "").startswith("sm_")
-        load_stream = mx.cpu if use_cpu_staging else mx.default_stream(mx.default_device())
-        with mx.stream(load_stream):
+        with mx.stream(mx.cpu) if use_cpu_staging else nullcontext():
             native = Model(ModelArgs.from_dict(self.config))
 
             def quantization(path, module):
@@ -39,7 +39,7 @@ class QATModel:
             nn.quantize(native, class_predicate=quantization)
             weights = {}
             for path in sorted(directory.glob("model-*.safetensors")):
-                shard = mx.load(str(path), stream=load_stream)
+                shard = mx.load(str(path), stream=mx.cpu) if use_cpu_staging else mx.load(str(path))
                 assert not weights.keys() & shard.keys(), f"Duplicate tensor in {path}"
                 weights.update(shard)
             native.load_weights(list(native.sanitize(weights).items()), strict=True)
