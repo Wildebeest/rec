@@ -289,6 +289,7 @@ def make_server(
                     request.generation_context.stop()
 
     if address[0] in ("0.0.0.0", "::"):
+
         class DualStackHTTPServer(ThreadingHTTPServer):
             address_family = socket.AF_INET6
 
@@ -299,8 +300,6 @@ def make_server(
         server = DualStackHTTPServer(("::", address[1]), Handler)
     else:
         server = ThreadingHTTPServer(address, Handler)
-    generator = Generator(
-        engine, metrics_path, defaults, sleep_idle_seconds=sleep_idle_seconds
-    )
+    generator = Generator(engine, metrics_path, defaults, sleep_idle_seconds=sleep_idle_seconds)
     server.generator = generator
     return server
