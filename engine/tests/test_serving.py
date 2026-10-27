@@ -44,6 +44,7 @@ class Engine:
         self.active = 0
         self.max_active = 0
         self.failure = None
+        self.oom_recoveries = 0
         self.constraint = SimpleNamespace(stops=(0,))
         self.constraints = SimpleNamespace(tools=Mock(return_value=self.constraint))
         self.grammars = []
@@ -104,6 +105,9 @@ class Engine:
             }
         finally:
             self.active -= 1
+
+    def recover_from_oom(self):
+        self.oom_recoveries += 1
 
 
 class ServingTest(unittest.TestCase):
@@ -300,6 +304,27 @@ class ServingTest(unittest.TestCase):
         finally:
             conn.close()
         self.assertEqual(self.request("C")[0], 503)
+
+    def test_oom_recovers_and_keeps_worker_healthy(self):
+        first = self.pool.submit(self.request, "A", max_tokens=5)
+        self.assertTrue(self.engine.started.wait(3))
+        self.engine.failure = RuntimeError(
+            "cudaMallocAsync(&data, size, stream) failed: out of memory"
+        )
+        self.engine.release.set()
+        with self.assertRaises(http.client.RemoteDisconnected):
+            first.result()
+        self.assertEqual(self.engine.oom_recoveries, 1)
+        self.engine.failure = None
+        self.assertEqual(self.request("B", max_tokens=1)[0], 200)
+        conn = http.client.HTTPConnection(*self.server.server_address, timeout=5)
+        try:
+            conn.request("GET", "/health")
+            response = conn.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(json.loads(response.read())["status"], "ready")
+        finally:
+            conn.close()
 
     def test_listen_backlog_holds_a_burst_of_connections(self):
         # Connections beyond the backlog are reset (macOS) or dropped (Linux) before a handler runs.

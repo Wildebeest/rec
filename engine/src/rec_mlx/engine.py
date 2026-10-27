@@ -239,6 +239,13 @@ class Engine:
             logging.info("Engine woke from sleep in %.2fs", time.perf_counter() - start)
             return True
 
+    def recover_from_oom(self):
+        self._prompt_cache = None
+        self._prefix_preparation = None
+        gc.collect()
+        self.mx.synchronize()
+        self.mx.clear_cache()
+
     def _gpu_stream(self):
         # Metal streams are thread-local; HTTP handlers run outside the model-loading thread.
         local = getattr(self, "_local", None)
@@ -277,6 +284,13 @@ class Engine:
             except PrefillCancelled:
                 self.mx.synchronize()
                 self.mx.clear_cache()
+            except RuntimeError as error:
+                if (
+                    "out of memory" in str(error).lower()
+                    or "insufficient memory" in str(error).lower()
+                ):
+                    self.recover_from_oom()
+                raise
 
     def prepare_prefix(self, *, should_stop=lambda: False):
         if self.sleeping:
