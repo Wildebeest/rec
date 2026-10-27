@@ -3,7 +3,9 @@ from __future__ import annotations
 import mlx.core as mx
 from mlx_lm.models.base import create_causal_mask
 
-_copy = mx.fast.metal_kernel(
+from .kernels.megakernel import _metal
+
+_copy = _metal(
     name="flint_copy_cache",
     input_names=["values", "size"],
     output_names=["snapshot"],
@@ -27,7 +29,7 @@ def copy_array(value):
     return snapshot
 
 
-_write = mx.fast.metal_kernel(
+_write = _metal(
     name="flint_write_kv",
     input_names=["storage", "keys", "values", "layout"],
     output_names=["done"],

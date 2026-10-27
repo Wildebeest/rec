@@ -65,6 +65,11 @@ def build_decoder(model, *, optimized, skip_guards=False):
             from rec_mlx.kernels.m4_max import transform as m4_max
 
             spec = dict(spec, header=m4_max(spec["header"]))
+        if profile.chip == "RTX 5090":
+            from rec_mlx.kernels.rtx_5090 import transform as rtx_5090
+
+            header, source = rtx_5090(spec["header"], spec["source"])
+            spec = dict(spec, header=header, source=source)
         engine.kernel = megakernel._metal(name="flint_decode_fast_activation", **spec)
         return engine, ResidentSampler(megakernel, engine, spec)
     finally:

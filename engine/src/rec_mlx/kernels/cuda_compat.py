@@ -10,7 +10,6 @@ def _ensure_cuda_path() -> None:
     candidates = [
         *(Path(p) / "nvidia" / "cu13" for p in sys.path if p),
         *(Path(p) / "nvidia" / "cuda_runtime" for p in sys.path if p),
-        Path("/home/wilde/.unsloth/studio/unsloth_studio/lib/python3.13/site-packages/nvidia/cu13"),
         Path("/usr/local/cuda"),
     ]
     for candidate in candidates:
@@ -103,6 +102,7 @@ __device__ __forceinline__ uint as_type<uint, float>(float v) {
 }
 
 namespace metal {
+    template <typename T> __device__ __forceinline__ T clamp(T x, T lo, T hi) { return x < lo ? lo : (x > hi ? hi : x); }
     __device__ __forceinline__ float abs(float x) { return fabsf(x); }
     __device__ __forceinline__ __nv_bfloat16 abs(__nv_bfloat16 x) { return __habs(x); }
     __device__ __forceinline__ float exp(float x) { return expf(x); }
@@ -233,6 +233,12 @@ def translate_msl_to_cuda(header: str, source: str) -> tuple[str, str]:
     header = _translate_pragmas(header)
     source = _translate_pragmas(source)
 
+    header = re.sub(
+        r"\bconstant\s+((?:float|uint|int|ushort|uchar|bfloat16_t)\s+\w+\s*\[)",
+        r"__device__ const \1",
+        header,
+    )
+
     # Remove the threadgroup-address-space overload of weight_matrix which is identical in CUDA.
     header = re.sub(
         r"inline\s+Matrix\s+weight_matrix\(const\s+device\s+uchar\*\s*bank,\s*const\s+threadgroup\s+uint\*\s*d\)\s*\{\s*return\s*\{[^}]+\};\s*\}",
@@ -258,37 +264,6 @@ def translate_msl_to_cuda(header: str, source: str) -> tuple[str, str]:
         source,
     )
 
-    # Vectorize 8-byte weight loads in dot16 and dot16_w197_bias23 via read-only cache (__ldg).
-    header = header.replace(
-        "const device ushort* p=(const device ushort*)w;",
-        "const uint2 _w2=__ldg((const uint2*)w);const uint p[4]={_w2.x&0xffffu,_w2.x>>16,_w2.y&0xffffu,_w2.y>>16};",
-    )
-
-    # Vectorize 8-byte activation loads in load16.
-    header = header.replace(
-        "inline float load16(const device bfloat16_t* x, thread float* v) {\n"
-        "    float sum=0.0f;\n"
-        "    for(uint i=0;i<16;i+=4) {\n"
-        "        sum+=x[i]+x[i+1]+x[i+2]+x[i+3];\n"
-        "        v[i]=x[i];v[i+1]=x[i+1]/16.0f;\n"
-        "        v[i+2]=x[i+2]/256.0f;v[i+3]=x[i+3]/4096.0f;\n"
-        "    }\n"
-        "    return sum;\n"
-        "}",
-        "inline float load16(const device bfloat16_t* x, thread float* v) {\n"
-        "    float sum=0.0f;\n"
-        "    #pragma unroll\n"
-        "    for(uint i=0;i<16;i+=4) {\n"
-        "        const uint2 _x2=__ldg((const uint2*)(x+i));\n"
-        "        const bfloat16_t* _xp=(const bfloat16_t*)&_x2;\n"
-        "        sum+=_xp[0]+_xp[1]+_xp[2]+_xp[3];\n"
-        "        v[i]=_xp[0];v[i+1]=_xp[1]/16.0f;\n"
-        "        v[i+2]=_xp[2]/256.0f;v[i+3]=_xp[3]/4096.0f;\n"
-        "    }\n"
-        "    return sum;\n"
-        "}",
-    )
-
     # Eliminate redundant back-to-back device fences in barrier helpers.
     header = header.replace(
         "atomic_thread_fence(mem_flags::mem_device,memory_order_seq_cst,thread_scope_device);\n"
@@ -296,196 +271,8 @@ def translate_msl_to_cuda(header: str, source: str) -> tuple[str, str]:
         "threadgroup_barrier(mem_flags::mem_device);",
     )
 
-    # Widen expert_team_gateup from 2 rows/iter to 4 rows/iter to halve load16_local calls.
-    header = header.replace(
-        "    for(uint local=role_sg*2;local<width;local+=teams*8*2) {\n"
-        "        float ga[2]={0.0f,0.0f},ua[2]={0.0f,0.0f};\n"
-        "        for(uint b=0;b<2048;b+=512) {\n"
-        "            uint scalar=b+lane*16;float v[16];float sum=load16_local(x+scalar,v);\n"
-        "            for(uint j=0;j<2;++j) {\n"
-        "                uint row=expert*g.n+local+j,gi=row*32+scalar/64;\n"
-        "                ga[j]+=dot16(g.w+size_t(row)*1024+scalar/2,v,float(g.s[gi]),float(g.b[gi]),sum);\n"
-        "                ua[j]+=dot16(u.w+size_t(row)*1024+scalar/2,v,float(u.s[gi]),float(u.b[gi]),sum);\n"
-        "            }\n"
-        "        }\n"
-        "        for(uint j=0;j<2;++j) {",
-        "    for(uint local=role_sg*4;local<width;local+=teams*8*4) {\n"
-        "        float ga[4]={0.0f,0.0f,0.0f,0.0f},ua[4]={0.0f,0.0f,0.0f,0.0f};\n"
-        "        for(uint b=0;b<2048;b+=512) {\n"
-        "            uint scalar=b+lane*16;float v[16];float sum=load16_local(x+scalar,v);\n"
-        "            #pragma unroll\n"
-        "            for(uint j=0;j<4;++j) {\n"
-        "                uint row=expert*width+local+j,gi=row*32+scalar/64;\n"
-        "                ga[j]+=dot16(g.w+size_t(row)*1024+scalar/2,v,float(__ldg(&g.s[gi])),float(__ldg(&g.b[gi])),sum);\n"
-        "                ua[j]+=dot16(u.w+size_t(row)*1024+scalar/2,v,float(__ldg(&u.s[gi])),float(__ldg(&u.b[gi])),sum);\n"
-        "            }\n"
-        "        }\n"
-        "        #pragma unroll\n"
-        "        for(uint j=0;j<4;++j) {",
-    )
-
-    # Hoist loop-invariant load16 out of the row loop in expert_team_down and specialize k=512/1024.
-    header = header.replace(
-        "    for(uint local=role_sg*4;local<2048;local+=teams*8*4) {\n"
-        "        float a[4]={0.0f,0.0f,0.0f,0.0f};\n"
-        "        for(uint b=0;b<m.k;b+=512) {\n"
-        "            uint scalar=b+lane*16;float v[16];float sum=load16(input+scalar,v);\n"
-        "            for(uint j=0;j<4;++j) {\n"
-        "                uint row=expert*2048+local+j,gi=row*(m.k/64)+scalar/64;\n"
-        "                a[j]+=dot16_w197_bias23(m.w+size_t(row)*(m.k/2)+scalar/2,v,float(m.s[gi]),float(m.b[gi]),sum);\n"
-        "            }\n"
-        "        }\n"
-        "        for(uint j=0;j<4;++j){float v=simd_sum(a[j]);if(lane==0)out[role*2048+local+j]=bfloat16_t(v);}\n"
-        "    }",
-        "    if(!shared) {\n"
-        "        uint scalar=lane*16;float v[16];float sum=load16(input+scalar,v);\n"
-        "        for(uint local=role_sg*4;local<2048;local+=teams*8*4) {\n"
-        "            float a[4]={0.0f,0.0f,0.0f,0.0f};\n"
-        "            #pragma unroll\n"
-        "            for(uint j=0;j<4;++j) {\n"
-        "                uint row=expert*2048+local+j,gi=row*8+scalar/64;\n"
-        "                a[j]+=dot16_w197_bias23(m.w+size_t(row)*256+scalar/2,v,float(__ldg(&m.s[gi])),float(__ldg(&m.b[gi])),sum);\n"
-        "            }\n"
-        "            #pragma unroll\n"
-        "            for(uint j=0;j<4;++j){float val=simd_sum(a[j]);if(lane==0)out[role*2048+local+j]=bfloat16_t(val);}\n"
-        "        }\n"
-        "    } else {\n"
-        "        float v0[16],v1[16];\n"
-        "        float sum0=load16(input+lane*16,v0),sum1=load16(input+512+lane*16,v1);\n"
-        "        for(uint local=role_sg*4;local<2048;local+=teams*8*4) {\n"
-        "            float a[4]={0.0f,0.0f,0.0f,0.0f};\n"
-        "            #pragma unroll\n"
-        "            for(uint j=0;j<4;++j) {\n"
-        "                uint row=local+j,gi0=row*16+lane/4,gi1=gi0+8;\n"
-        "                a[j]+=dot16_w197_bias23(m.w+size_t(row)*512+lane*8,v0,float(__ldg(&m.s[gi0])),float(__ldg(&m.b[gi0])),sum0);\n"
-        "                a[j]+=dot16_w197_bias23(m.w+size_t(row)*512+256+lane*8,v1,float(__ldg(&m.s[gi1])),float(__ldg(&m.b[gi1])),sum1);\n"
-        "            }\n"
-        "            #pragma unroll\n"
-        "            for(uint j=0;j<4;++j){float val=simd_sum(a[j]);if(lane==0)out[role*2048+local+j]=bfloat16_t(val);}\n"
-        "        }\n"
-        "    }",
-    )
-
-    # Distribute q4 (o_proj, m.n=2048) at 2 rows/warp so 1024 warps (128 SMs) participate instead of 512 warps (64 SMs).
-    header = header.replace(
-        "template<uint K>\n"
-        "inline void q4(Matrix m,const device bfloat16_t* x,device bfloat16_t* out,\n"
-        "               uint lane,uint sg,uint groups,uint expert=0) {\n"
-        "    for(uint first=sg*4;first<m.n;first+=groups*4) {\n"
-        "        float a[4]={0.0f,0.0f,0.0f,0.0f};\n"
-        "        for(uint block=0;block<K;block+=512) {\n"
-        "            uint scalar=block+lane*16;\n"
-        "            float v[16];float sum=load16(x+scalar,v);\n"
-        "            for(uint r=0;r<4;++r) {\n"
-        "                uint row=expert*m.n+first+r;uint gi=row*(K/64)+scalar/64;\n"
-        "                a[r]+=dot16(m.w+size_t(row)*(K/2)+scalar/2,v,float(m.s[gi]),float(m.b[gi]),sum);\n"
-        "            }\n"
-        "        }\n"
-        "        for(uint r=0;r<4;++r) {\n"
-        "            float v=simd_sum(a[r]);if(lane==0)out[first+r]=bfloat16_t(v);\n"
-        "        }\n"
-        "    }\n"
-        "}",
-        "template<uint K>\n"
-        "inline void q4(Matrix m,const device bfloat16_t* x,device bfloat16_t* out,\n"
-        "               uint lane,uint sg,uint groups,uint expert=0) {\n"
-        "    for(uint first=sg*2;first<m.n;first+=groups*2) {\n"
-        "        float a[2]={0.0f,0.0f};\n"
-        "        for(uint block=0;block<K;block+=512) {\n"
-        "            uint scalar=block+lane*16;\n"
-        "            float v[16];float sum=load16(x+scalar,v);\n"
-        "            #pragma unroll\n"
-        "            for(uint r=0;r<2;++r) {\n"
-        "                uint row=expert*m.n+first+r;uint gi=row*(K/64)+scalar/64;\n"
-        "                a[r]+=dot16(m.w+size_t(row)*(K/2)+scalar/2,v,float(__ldg(&m.s[gi])),float(__ldg(&m.b[gi])),sum);\n"
-        "            }\n"
-        "        }\n"
-        "        #pragma unroll\n"
-        "        for(uint r=0;r<2;++r) {\n"
-        "            float v=simd_sum(a[r]);if(lane==0)out[first+r]=bfloat16_t(v);\n"
-        "        }\n"
-        "    }\n"
-        "}",
-    )
-
-    # Use read-only cache (__ldg) for quantization scales and biases in q4_local and q4_local_block.
-    header = header.replace(
-        "float(m.s[gi]),float(m.b[gi])",
-        "float(__ldg(&m.s[gi])),float(__ldg(&m.b[gi]))",
-    )
-
-    # Coalesce 4-element bfloat16 KV loads in attention_partial_path_w53 into 64-bit __ldg(uint2*),
-    # specialize direct p0 pointer arithmetic for !ROUNDED (all 34 SWA layers),
-    # share K/V address calculation, and avoid dynamic register-array indexing.
-    header = header.replace(
-        "            float key[4],value[4];for(uint j=0;j<4;++j){key[j]=float(key_base[at+j]);value[j]=float(value_base[at+j]);}",
-        "            bfloat16_t rk[4],rv[4];\n"
-        "            const device bfloat16_t* kp=key_base.address(at);\n"
-        "            *((uint2*)rk)=__ldg((const uint2*)kp);\n"
-        "            *((uint2*)rv)=__ldg((const uint2*)(kp+cap*512u));\n"
-        "            float key[4],value[4];for(uint j=0;j<4;++j){key[j]=float(rk[j]);value[j]=float(rv[j]);}",
-    )
-    header = header.replace(
-        "        if(token<count)for(uint j=0;j<4;++j) {\n"
-        "            uint at=uint(token)*128+j;\n"
-        "            next_key[j]=key_base[at];next_value[j]=value_base[at];\n"
-        "        }",
-        "        if(token<count) {\n"
-        "            uint at=uint(token)*128;\n"
-        "            const device bfloat16_t* kp=ROUNDED?key_base.address(at):(key_base.p0+key_base.offset+at);\n"
-        "            *((uint2*)next_key)=__ldg((const uint2*)kp);\n"
-        "            *((uint2*)next_value)=__ldg((const uint2*)(kp+cap*512u));\n"
-        "        }",
-    )
-    header = header.replace(
-        "            float key[4];bfloat16_t value[4];\n"
-        "            for(uint j=0;j<4;++j){key[j]=float(next_key[j]);value[j]=next_value[j];}\n"
-        "            if(token+parts<count)for(uint j=0;j<4;++j) {\n"
-        "                uint next=at+parts*128+j;\n"
-        "                next_key[j]=key_base[next];next_value[j]=value_base[next];\n"
-        "            }\n"
-        "            float scores[HEADS];\n"
-        "            for(uint h=0;h<HEADS;++h) {\n"
-        "                float score=0.0f;for(uint j=0;j<4;++j)score+=query[h][j]*key[j];\n"
-        "                scores[h]=simd_sum(score);\n"
-        "            }\n"
-        "            float old=0.0f,add=0.0f;\n"
-        "            if(lane<HEADS) {\n"
-        "                float score=scores[lane],next=max(hi,score),low=metal::fast::exp(-metal::abs(score-hi));",
-        "            float key[4],value[4];\n"
-        "            #pragma unroll\n"
-        "            for(uint j=0;j<4;++j){key[j]=float(next_key[j]);value[j]=float(next_value[j]);}\n"
-        "            if(token+parts<count) {\n"
-        "                uint next=at+parts*128;\n"
-        "                const device bfloat16_t* kp=ROUNDED?key_base.address(next):(key_base.p0+key_base.offset+next);\n"
-        "                *((uint2*)next_key)=__ldg((const uint2*)kp);\n"
-        "                *((uint2*)next_value)=__ldg((const uint2*)(kp+cap*512u));\n"
-        "            }\n"
-        "            float my_score=0.0f;\n"
-        "            #pragma unroll\n"
-        "            for(uint h=0;h<HEADS;++h) {\n"
-        "                float score=0.0f;\n"
-        "                #pragma unroll\n"
-        "                for(uint j=0;j<4;++j)score+=query[h][j]*key[j];\n"
-        "                score=simd_sum(score);\n"
-        "                if(lane==h)my_score=score;\n"
-        "            }\n"
-        "            float old=0.0f,add=0.0f;\n"
-        "            if(lane<HEADS) {\n"
-        "                float score=my_score,next=max(hi,score),low=metal::fast::exp(-metal::abs(score-hi));",
-    )
-    header = header.replace(
-        "for(uint j=0;j<4;++j)acc[h][j]=acc[h][j]*factor+weight*float(value[j]);",
-        "#pragma unroll\n                for(uint j=0;j<4;++j)acc[h][j]=acc[h][j]*factor+weight*value[j];",
-    )
-
-    # Align long-context global attention partition counts (parts) to 160-SM (1280-warp / 320-warp-per-KV-team) waves on RTX 5090.
-    source = source.replace(
-        "uint parts=rounded?(count==1024?64:count<=8192?128:(count<=32768?256:(count<=65536?512:1024))):32;",
-        "uint parts=rounded?(count==1024?64:count<=16384?320:(count<=65536?640:960)):32;",
-    )
-
     # Scalar bool input 'active' in FilteredResidentSampler is passed as const bool* in CUDA.
     source = source.replace("if(!active)", "if(!(*active))")
 
     return CUDA_COMPAT_HEADER + "\n" + header + "\n", source
+

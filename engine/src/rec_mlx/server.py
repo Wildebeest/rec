@@ -355,10 +355,9 @@ def make_server(
                 if request.generation_context is not None:
                     request.generation_context.stop()
 
-<<<<<<< HEAD
     if address[0] in ("0.0.0.0", "::"):
 
-        class DualStackHTTPServer(ThreadingHTTPServer):
+        class DualStackHTTPServer(Server):
             address_family = socket.AF_INET6
 
             def server_bind(self):
@@ -367,11 +366,7 @@ def make_server(
 
         server = DualStackHTTPServer(("::", address[1]), Handler)
     else:
-        server = ThreadingHTTPServer(address, Handler)
+        server = Server(address, Handler)
     generator = Generator(engine, metrics_path, defaults, sleep_idle_seconds=sleep_idle_seconds)
-=======
-    server = Server(address, Handler)
-    generator = Generator(engine, metrics_path, defaults)
->>>>>>> upstream/main
     server.generator = generator
     return server
