@@ -3,6 +3,7 @@ import hmac
 import io
 import json
 import logging
+import os
 import select
 import socket
 import threading
@@ -22,9 +23,35 @@ class RequestError(ValueError):
     pass
 
 
+SD_LISTEN_FDS_START = 3
+
+
+def _systemd_listen_fd():
+    listen_fds = int(os.environ.get("LISTEN_FDS", "0") or "0")
+    if listen_fds <= 0:
+        return None
+    listen_pid = os.environ.get("LISTEN_PID")
+    if listen_pid and int(listen_pid) != os.getpid():
+        return None
+    return SD_LISTEN_FDS_START
+
+
 class Server(ThreadingHTTPServer):
     # The default backlog of 5 resets a burst of connections before the accept loop takes them.
     request_queue_size = 32
+
+    def __init__(self, server_address, RequestHandlerClass, *, listen_fd=None):
+        if listen_fd is None:
+            listen_fd = _systemd_listen_fd()
+        if listen_fd is not None:
+            super().__init__(server_address, RequestHandlerClass, bind_and_activate=False)
+            self.socket.close()
+            self.socket = socket.socket(fileno=os.dup(listen_fd))
+            self.address_family = self.socket.family
+            self.server_address = self.socket.getsockname()[:2]
+            self.server_port = self.server_address[1]
+        else:
+            super().__init__(server_address, RequestHandlerClass)
 
 
 def make_server(
@@ -36,6 +63,7 @@ def make_server(
     api_key=None,
     grammar_mode="flint",
     sleep_idle_seconds: float = 0.0,
+    listen_fd=None,
 ):
     from mlx_lm.server import APIHandler
 
@@ -355,7 +383,11 @@ def make_server(
                 if request.generation_context is not None:
                     request.generation_context.stop()
 
-    if address[0] in ("0.0.0.0", "::"):
+    if listen_fd is None:
+        listen_fd = _systemd_listen_fd()
+    if listen_fd is not None:
+        server = Server(address, Handler, listen_fd=listen_fd)
+    elif address[0] in ("0.0.0.0", "::"):
 
         class DualStackHTTPServer(Server):
             address_family = socket.AF_INET6

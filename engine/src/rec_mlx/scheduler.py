@@ -69,6 +69,8 @@ class Generator(ResponseGenerator):
         self._request_lock = threading.Lock()
         self._gpu_lock = threading.Lock()
         self.active_context = None
+        self.worker_failed = False
+        self.on_failure = None
         super().__init__(ModelProvider(engine, self.tokenizer, cli_args), prompt_cache=None)
         if self.sleep_idle_seconds > 0:
             self._idle_thread = threading.Thread(target=self._idle_loop, daemon=True)
@@ -117,9 +119,14 @@ class Generator(ResponseGenerator):
     def _generate(self):
         try:
             super()._generate()
+        except BaseException:
+            self.worker_failed = True
+            raise
         finally:
             # If the worker fails, wake HTTP clients and preserve its full traceback.
             self.cancel()
+            if self.worker_failed and self.on_failure is not None:
+                self.on_failure()
 
     def generate(self, request, generation_args, progress_callback=None):
         response_queue = Queue()
