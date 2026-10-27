@@ -173,5 +173,70 @@ class RoutingTests(unittest.TestCase):
             self.assertTrue(mx.array_equal(trace[2048:], expected).item(), seed)
 
 
+class CudaTransformTests(unittest.TestCase):
+    def test_rtx_5090_and_cuda_compat_transforms(self):
+        from rec_mlx.kernels import (
+            activation_optimization,
+            cuda_compat,
+            kv_teams,
+            resident_optimizations,
+            rtx_5090,
+        )
+
+        header = resident_optimizations.transform(expert_teams.transform(megakernel._HEADER, 128))
+        body = megakernel._BODY
+        replacements = {
+            "WORKERS": "160",
+            "GROUPS": "1280",
+            "THREADS": "40960",
+            "GROUP_THREADS": "256",
+            "GROUP_SIMDS": "8",
+            "KV_FIRST": "0",
+            "PROFILE": "0",
+            "SHORT_HEADS": "4",
+            "LONG_HEADS": "8",
+            "LONG_CONTEXT": "1024",
+            "UNROLL": "1",
+            "TEAM_MLP_WORKERS": "128",
+            "EPS": "1e-6f",
+            "LOGBASE": "13.287712379549449f",
+            "ATTENTION_WORKERS": "160",
+            "ATTENTION_GROUPS": "1280",
+            "MERGE_WORKERS": "160",
+            "MERGE_GROUPS": "1280",
+            "ROUTER_WORKERS": "160",
+            "ROUTER_GROUPS": "1280",
+            "MLP_WORKERS": "128",
+            "MLP_GROUPS": "1024",
+            "HEAD_WORKERS": "160",
+            "HEAD_GROUPS": "1280",
+        }
+        for key, value in replacements.items():
+            header = header.replace("__" + key + "__", value)
+            body = body.replace("__" + key + "__", value)
+        header, body = rank_routing.transform(header, body, 128)
+        header, body = kv_teams.transform(header, body, 160)
+        model = SimpleNamespace(
+            embedding=SimpleNamespace(bits=8),
+            head=SimpleNamespace(bits=4),
+            config={"mlx_export": {"routed_expert_bits": 3}},
+        )
+        header, body = mixed_bits.transform(header, body, model, 128, True)
+        header = activation_optimization.transform(header)
+        header, body = rtx_5090.transform(header, body)
+        self.assertIn("__ldg((const uint2*)w)", function(header, "dot16"))
+        self.assertIn("__ldg((const uint2*)kp)", function(header, "attention_partial_path_w53"))
+        self.assertIn("count<=16384?320:(count<=65536?640:960)", body)
+
+        cuda_header, cuda_source = cuda_compat.translate_msl_to_cuda(
+            header + "\nconstant float STEER_DIRECTION[2048]={0.0f};\n",
+            body + "\nif(!active) { return; }\n",
+        )
+        self.assertIn("namespace metal", cuda_header)
+        self.assertIn("clamp(T x, T lo, T hi)", cuda_header)
+        self.assertIn("__device__ const float STEER_DIRECTION[2048]", cuda_header)
+        self.assertIn("if(!(*active))", cuda_source)
+
+
 if __name__ == "__main__":
     unittest.main()
