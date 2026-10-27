@@ -149,7 +149,7 @@ def main():
             server.generator.cancel()
             server.generator.join()
             server.server_close()
-        if server.generator.worker_failed:
+        if server.generator.worker_failed is True:
             raise SystemExit(1)
         return
     chat(engine, settings, args.metrics, grammar_mode=args.grammar)

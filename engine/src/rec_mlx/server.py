@@ -46,8 +46,8 @@ class Server(ThreadingHTTPServer):
         if listen_fd is not None:
             super().__init__(server_address, RequestHandlerClass, bind_and_activate=False)
             self.socket.close()
-            family = socket.AF_INET6 if ":" in str(server_address[0]) else self.address_family
-            self.socket = socket.fromfd(listen_fd, family, self.socket_type)
+            self.socket = socket.socket(fileno=os.dup(listen_fd))
+            self.address_family = self.socket.family
             self.server_address = self.socket.getsockname()[:2]
             self.server_port = self.server_address[1]
         else:
