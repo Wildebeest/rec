@@ -3,32 +3,14 @@ from __future__ import annotations
 import mlx.core as mx
 from mlx_lm.models.base import create_causal_mask
 
-_IS_CUDA = mx.device_info().get("architecture", "").startswith("sm_")
-if _IS_CUDA:
-    from .kernels.cuda_compat import _ensure_cuda_path
-
-    _ensure_cuda_path()
-
-_copy = (
-    mx.fast.cuda_kernel(
-        name="flint_copy_cache",
-        input_names=["values", "size"],
-        output_names=["snapshot"],
-        source="""
-            uint32_t i=blockIdx.x*blockDim.x+threadIdx.x;
-            if(i<size[0])snapshot[i]=values[i];
-        """,
-    )
-    if _IS_CUDA
-    else mx.fast.metal_kernel(
-        name="flint_copy_cache",
-        input_names=["values", "size"],
-        output_names=["snapshot"],
-        source="""
-            uint i=thread_position_in_grid.x;
-            if(i<size[0])snapshot[i]=values[i];
-        """,
-    )
+_copy = mx.fast.metal_kernel(
+    name="flint_copy_cache",
+    input_names=["values", "size"],
+    output_names=["snapshot"],
+    source="""
+        uint i=thread_position_in_grid.x;
+        if(i<size[0])snapshot[i]=values[i];
+    """,
 )
 
 
@@ -45,40 +27,21 @@ def copy_array(value):
     return snapshot
 
 
-_write = (
-    mx.fast.cuda_kernel(
-        name="flint_write_kv",
-        input_names=["storage", "keys", "values", "layout"],
-        output_names=["done"],
-        source="""
-            uint32_t i=blockIdx.x*blockDim.x+threadIdx.x, count=layout[3];
-            if(i<count*512u) {
-                uint32_t head=i/(count*128u), pos=(i/128u)%count, dim=i%128u;
-                uint32_t offset=layout[0]+(head*layout[1]+layout[2]+pos)*128u+dim;
-                __nv_bfloat16* target=(__nv_bfloat16*)storage;
-                target[offset]=keys[i];
-                target[offset+layout[1]*512u]=values[i];
-            }
-            if(i==0)done[0]=0;
-        """,
-    )
-    if _IS_CUDA
-    else mx.fast.metal_kernel(
-        name="flint_write_kv",
-        input_names=["storage", "keys", "values", "layout"],
-        output_names=["done"],
-        source="""
-            uint i=thread_position_in_grid.x, count=layout[3];
-            if(i<count*512u) {
-                uint head=i/(count*128u), pos=(i/128u)%count, dim=i%128u;
-                uint offset=layout[0]+(head*layout[1]+layout[2]+pos)*128u+dim;
-                device bfloat16_t* target=(device bfloat16_t*)storage;
-                target[offset]=keys[i];
-                target[offset+layout[1]*512u]=values[i];
-            }
-            if(i==0)done[0]=0;
-        """,
-    )
+_write = mx.fast.metal_kernel(
+    name="flint_write_kv",
+    input_names=["storage", "keys", "values", "layout"],
+    output_names=["done"],
+    source="""
+        uint i=thread_position_in_grid.x, count=layout[3];
+        if(i<count*512u) {
+            uint head=i/(count*128u), pos=(i/128u)%count, dim=i%128u;
+            uint offset=layout[0]+(head*layout[1]+layout[2]+pos)*128u+dim;
+            device bfloat16_t* target=(device bfloat16_t*)storage;
+            target[offset]=keys[i];
+            target[offset+layout[1]*512u]=values[i];
+        }
+        if(i==0)done[0]=0;
+    """,
 )
 
 # Four append-only blocks fit alongside the fused decoder's weight/scratch buffers.
@@ -125,13 +88,14 @@ class KVStorage:
             self.capacity = (index + 1) * BLOCK_TOKENS
 
     def shrink(self, capacity):
-        count = max(1, (capacity + BLOCK_TOKENS - 1) // BLOCK_TOKENS)
-        current = self.capacity // BLOCK_TOKENS
+        block_tokens = getattr(self, "block_tokens", BLOCK_TOKENS)
+        count = max(1, (capacity + block_tokens - 1) // block_tokens)
+        current = self.capacity // block_tokens
         if count < current:
             for index in range(count, current):
                 self.banks[index] = mx.zeros((1, 1024), mx.bfloat16)
                 mx.eval(self.banks[index])
-            self.capacity = count * BLOCK_TOKENS
+            self.capacity = count * block_tokens
             mx.synchronize()
             mx.clear_cache()
 
@@ -192,8 +156,6 @@ class FixedKVCache:
     def make_mask(self, n_tokens: int, window_size=None, return_array: bool = False):
         if n_tokens == 1 and not return_array:
             return None
-        if window_size is None and not return_array:
-            return "causal"
         return create_causal_mask(n_tokens, offset=self.offset, window_size=window_size)
 
     def update_and_fetch(self, keys: mx.array, values: mx.array):

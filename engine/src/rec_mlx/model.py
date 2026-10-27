@@ -310,7 +310,7 @@ class FlintTransformer(nn.Module):
             if should_stop is not None and should_stop():
                 raise PrefillCancelled()
             h = layer(h, full_mask if kind == "full_attention" else swa_mask, c)
-            if should_stop is not None or (c is not None and h.shape[1] > 1):
+            if should_stop is not None:
                 mx.eval(h, c.state)
         return self.norm(h)
 

@@ -2,15 +2,12 @@ import threading
 import unittest
 import weakref
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import mlx.core as mx
-from mlx_lm.models.base import create_causal_mask
 
 from rec_mlx.cache import BLOCK_TOKENS, FixedKVCache, KVStorage
 from rec_mlx.engine import Engine, Sampling
 from rec_mlx.kernels.megakernel import FullModel
-from rec_mlx.model import FlintTransformer, ModelArgs
 from rec_mlx.prefix import PrefillCancelled, PrefixPreparation, PromptCache
 from rec_mlx.quantized import QATSession
 
@@ -22,10 +19,7 @@ class SharedKVTests(unittest.TestCase):
             row[1] = index % 4 == 0
         return KVStorage(metadata, capacity)
 
-    @unittest.skipUnless(
-        mx.metal.is_available() or mx.device_info().get("architecture", "").startswith("sm_"),
-        "requires Apple Metal or CUDA",
-    )
+    @unittest.skipUnless(mx.metal.is_available(), "requires Apple Metal")
     def test_native_views_follow_shared_writes_and_growth(self):
         storage = self.storage()
         cache = FixedKVCache(storage, 0)
@@ -45,22 +39,6 @@ class SharedKVTests(unittest.TestCase):
         actual = cache.update_and_fetch(keys, values)
         self.assertTrue(mx.array_equal(actual[0][:, :, BLOCK_TOKENS - 2 :], keys).item())
         self.assertTrue(mx.array_equal(actual[1][:, :, BLOCK_TOKENS - 2 :], values).item())
-
-    def test_fixed_kv_cache_make_mask_is_causal(self):
-        cache = FixedKVCache(self.storage(), 0)
-        self.assertIsNone(cache.make_mask(1))
-        self.assertEqual(cache.make_mask(3), "causal")
-        self.assertTrue(
-            mx.array_equal(cache.make_mask(3, return_array=True), create_causal_mask(3)).item()
-        )
-        cache.offset = 2
-        self.assertEqual(cache.make_mask(3), "causal")
-        self.assertTrue(
-            mx.array_equal(
-                cache.make_mask(3, window_size=4, return_array=True),
-                create_causal_mask(3, offset=2, window_size=4),
-            ).item()
-        )
 
     def test_prefill_allocates_only_the_current_chunk(self):
         metadata = [[0] * 64 for _ in range(50)]
@@ -218,36 +196,6 @@ class EngineMemoryTests(unittest.TestCase):
         self.assertIsNone(engine._prefix_preparation)
         self.assertIs(engine._prompt_cache, session.prompt_cache)
         self.assertIsNot(engine._prompt_cache, preparation.origin)
-
-    def test_flint_transformer_evaluates_each_layer_during_prefill(self):
-        model = FlintTransformer(
-            ModelArgs(
-                num_hidden_layers=2,
-                hidden_size=512,
-                intermediate_size=128,
-                moe_intermediate_size=32,
-                shared_expert_intermediate_size=32,
-                num_attention_heads=4,
-                num_key_value_heads=4,
-                head_dim=128,
-                num_experts=4,
-                num_experts_per_tok=2,
-                mlp_only_layers=[0],
-                layer_types=["full_attention", "sliding_attention"],
-                vocab_size=128,
-            )
-        )
-        storage = self.storage()
-        caches = [FixedKVCache(storage, index) for index in range(len(model.layers))]
-        with patch("mlx.core.eval") as eval_spy:
-            model(
-                None,
-                cache=caches,
-                input_embeddings=mx.zeros((1, 2, model.args.hidden_size)),
-                should_stop=None,
-            )
-        evaluated = [call for call in eval_spy.call_args_list if len(call.args) == 2]
-        self.assertEqual(len(evaluated), len(model.layers))
 
 
 if __name__ == "__main__":
