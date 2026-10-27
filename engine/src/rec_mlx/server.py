@@ -3,6 +3,7 @@ import hmac
 import io
 import json
 import logging
+import os
 import select
 import socket
 import threading
@@ -22,13 +23,46 @@ class RequestError(ValueError):
     pass
 
 
+SD_LISTEN_FDS_START = 3
+
+
+def _systemd_listen_fd():
+    listen_fds = int(os.environ.get("LISTEN_FDS", "0") or "0")
+    if listen_fds <= 0:
+        return None
+    listen_pid = os.environ.get("LISTEN_PID")
+    if listen_pid and int(listen_pid) != os.getpid():
+        return None
+    return SD_LISTEN_FDS_START
+
+
 class Server(ThreadingHTTPServer):
     # The default backlog of 5 resets a burst of connections before the accept loop takes them.
     request_queue_size = 32
 
+    def __init__(self, server_address, RequestHandlerClass, *, listen_fd=None):
+        if listen_fd is None:
+            listen_fd = _systemd_listen_fd()
+        if listen_fd is not None:
+            super().__init__(server_address, RequestHandlerClass, bind_and_activate=False)
+            self.socket.close()
+            family = socket.AF_INET6 if ":" in str(server_address[0]) else self.address_family
+            self.socket = socket.fromfd(listen_fd, family, self.socket_type)
+            self.server_address = self.socket.getsockname()[:2]
+            self.server_port = self.server_address[1]
+        else:
+            super().__init__(server_address, RequestHandlerClass)
+
 
 def make_server(
-    engine, address, metrics_path, *, defaults=Sampling(), api_key=None, grammar_mode="flint"
+    engine,
+    address,
+    metrics_path,
+    *,
+    defaults=Sampling(),
+    api_key=None,
+    grammar_mode="flint",
+    listen_fd=None,
 ):
     from mlx_lm.server import APIHandler
 
@@ -340,7 +374,7 @@ def make_server(
                 if request.generation_context is not None:
                     request.generation_context.stop()
 
-    server = Server(address, Handler)
+    server = Server(address, Handler, listen_fd=listen_fd)
     generator = Generator(engine, metrics_path, defaults)
     server.generator = generator
     return server

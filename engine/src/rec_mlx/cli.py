@@ -135,6 +135,10 @@ def main():
             server.generator.cancel()
             threading.Thread(target=server.shutdown, daemon=True).start()
 
+        server.generator.on_failure = lambda: threading.Thread(
+            target=server.shutdown, daemon=True
+        ).start()
+
         signal.signal(signal.SIGTERM, stop)
         signal.signal(signal.SIGINT, stop)
         try:
@@ -145,6 +149,8 @@ def main():
             server.generator.cancel()
             server.generator.join()
             server.server_close()
+        if server.generator.worker_failed:
+            raise SystemExit(1)
         return
     chat(engine, settings, args.metrics, grammar_mode=args.grammar)
 

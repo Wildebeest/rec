@@ -266,10 +266,14 @@ class ServingTest(unittest.TestCase):
         second = self.pool.submit(self.request, "B", max_tokens=2)
         self.wait_queued()
         self.engine.failure = RuntimeError("decoder failure")
+        on_failure = Mock()
+        self.server.generator.on_failure = on_failure
         errors = []
         with patch.object(threading, "excepthook", side_effect=errors.append):
             self.engine.release.set()
             self.server.generator.join()
+        self.assertTrue(self.server.generator.worker_failed)
+        self.assertTrue(on_failure.called)
         with self.assertRaises(http.client.RemoteDisconnected):
             first.result()
         self.assertEqual(second.result()[0], 503)
@@ -285,6 +289,39 @@ class ServingTest(unittest.TestCase):
         finally:
             conn.close()
         self.assertEqual(self.request("C")[0], 503)
+
+    def test_systemd_socket_activation_attaches_to_existing_fd(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(5)
+        server = make_server(
+            self.engine,
+            ("127.0.0.1", 0),
+            Path(self.temp.name) / "metrics-fd",
+            listen_fd=sock.fileno(),
+        )
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        try:
+            conn = http.client.HTTPConnection(*sock.getsockname(), timeout=5)
+            try:
+                conn.request("GET", "/health")
+                response = conn.getresponse()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(json.loads(response.read())["status"], "ready")
+            finally:
+                conn.close()
+            server.shutdown()
+            server.server_close()
+            thread.join()
+            self.assertNotEqual(sock.fileno(), -1)
+        finally:
+            server.shutdown()
+            server.generator.cancel()
+            server.generator.join()
+            server.server_close()
+            thread.join()
+            sock.close()
 
     def test_listen_backlog_holds_a_burst_of_connections(self):
         # Connections beyond the backlog are reset (macOS) or dropped (Linux) before a handler runs.

@@ -58,6 +58,8 @@ class Generator(ResponseGenerator):
         self.busy = threading.Event()
         self._request_lock = threading.Lock()
         self.active_context = None
+        self.worker_failed = False
+        self.on_failure = None
         super().__init__(ModelProvider(engine, self.tokenizer, cli_args), prompt_cache=None)
 
     def cancel(self):
@@ -76,9 +78,14 @@ class Generator(ResponseGenerator):
     def _generate(self):
         try:
             super()._generate()
+        except BaseException:
+            self.worker_failed = True
+            raise
         finally:
             # If the worker fails, wake HTTP clients and preserve its full traceback.
             self.cancel()
+            if self.worker_failed and self.on_failure is not None:
+                self.on_failure()
 
     def generate(self, request, generation_args, progress_callback=None):
         response_queue = Queue()
