@@ -1,4 +1,5 @@
 import json
+import logging
 import sys
 import threading
 from dataclasses import asdict
@@ -15,6 +16,12 @@ from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer, TokenizerWrapper
 
 from .chat import parse_tool_call, seeded_tool_parser
 from .engine import Sampling
+
+
+def _is_oom(error: BaseException) -> bool:
+    return isinstance(error, (MemoryError, RuntimeError)) and (
+        "out of memory" in str(error).lower() or "insufficient memory" in str(error).lower()
+    )
 
 
 class ModelProvider:
@@ -120,6 +127,16 @@ class Generator(ResponseGenerator):
             finally:
                 responses.close()
             response_queue.put(None)
+        except (MemoryError, RuntimeError) as error:
+            if not _is_oom(error):
+                raise
+            logging.warning(
+                "Recovered from GPU out-of-memory during generation; clearing KV cache: %s", error
+            )
+            if hasattr(self.engine, "recover_from_oom"):
+                self.engine.recover_from_oom()
+            response_queue.put(error)
+            return
         finally:
             error = sys.exception()
             if error is not None:
@@ -132,6 +149,14 @@ class Generator(ResponseGenerator):
             self.engine.prepare_prefix(
                 should_stop=lambda: self.stopping.is_set() or not self.requests.empty()
             )
+        except (MemoryError, RuntimeError) as error:
+            if not _is_oom(error):
+                raise
+            logging.warning(
+                "Recovered from GPU out-of-memory during generation; clearing KV cache: %s", error
+            )
+            if hasattr(self.engine, "recover_from_oom"):
+                self.engine.recover_from_oom()
         finally:
             self.busy.clear()
 

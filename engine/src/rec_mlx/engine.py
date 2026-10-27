@@ -1,3 +1,4 @@
+import gc
 import hashlib
 import json
 import platform
@@ -141,6 +142,13 @@ class Engine:
         finally:
             events.close()
 
+    def recover_from_oom(self):
+        self._prompt_cache = None
+        self._prefix_preparation = None
+        gc.collect()
+        self.mx.synchronize()
+        self.mx.clear_cache()
+
     def generate_tokens(
         self,
         ids,
@@ -166,6 +174,13 @@ class Engine:
             except PrefillCancelled:
                 self.mx.synchronize()
                 self.mx.clear_cache()
+            except RuntimeError as error:
+                if (
+                    "out of memory" in str(error).lower()
+                    or "insufficient memory" in str(error).lower()
+                ):
+                    self.recover_from_oom()
+                raise
 
     def prepare_prefix(self, *, should_stop=lambda: False):
         from .prefix import PrefillCancelled
